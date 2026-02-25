@@ -13,7 +13,7 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
     try:
@@ -23,10 +23,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
         if user_id is None:
             raise HTTPException(status_code=401, detail="Token invalid")
     except JWTError:
-
         raise HTTPException(status_code=401, detail="Token expired or invalid")
 
-    # 2. Достаем юзера из базы, чтобы убедиться, что он существует
     result = await db.execute(select(Client).where(Client.id == int(user_id)))
     user = result.scalar_one_or_none()
     
@@ -34,3 +32,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
         raise HTTPException(status_code=401, detail="User not found")
         
     return user
+
+
+
+async def get_current_admin(current_user: Client = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=403, 
+            detail="Доступ запрещен: требуются права администратора"
+        )
+    return current_user
+

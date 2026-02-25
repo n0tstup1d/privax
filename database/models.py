@@ -12,8 +12,9 @@ class Client(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(nullable=False)
     password: Mapped[str] = mapped_column(nullable=False)
-
-    refresh_tokens: Mapped[List["RefreshToken"]] = relationship("RefreshToken", back_populates="owner", cascade="all, delete-orphan")
+    is_admin: Mapped[bool] = mapped_column(nullable=False, default=False)
+    
+    refresh_tokens: Mapped[List["RefreshToken"]] = relationship("RefreshToken", back_populates="client", cascade="all, delete-orphan")
 
 class RefreshToken(Base):
     __tablename__="refresh_tokens"
@@ -22,3 +23,4 @@ class RefreshToken(Base):
     
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"))
     client: Mapped["Client"] = relationship("Client", back_populates="refresh_tokens")
+    
