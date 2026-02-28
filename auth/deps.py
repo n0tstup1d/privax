@@ -36,7 +36,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
 
 
 async def get_current_admin(current_user: Client = Depends(get_current_user)):
-    if current_user.role != "admin":
+    if current_user.is_admin != True:
         raise HTTPException(
             status_code=403, 
             detail="Доступ запрещен: требуются права администратора"
