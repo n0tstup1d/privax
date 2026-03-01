@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from database.models import Base
 from database.database import engine
 from app.routers import auth, users
-from app.routers.admin import server
+from app.routers.admin import server, plans
 
 app = FastAPI(title="Privax API")
 
@@ -16,6 +16,8 @@ async def init_db():
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/users", tags=["Users"])
 app.include_router(server.router, prefix="/server", tags=["Servers(adm)"])
+app.include_router(plans.router, prefix="/plans", tags=["Plans(adm)"])
+
 
 @app.get("/")
 async def root():
