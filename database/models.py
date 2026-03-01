@@ -1,7 +1,7 @@
 from enum import Enum as PyEnum
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import ForeignKey, String, BigInteger, Float, DateTime, Boolean, Text, Enum
+from sqlalchemy import ForeignKey, String, Float, Text, Enum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -12,15 +12,30 @@ class Base(DeclarativeBase):
 # --- БИЛЛИНГ И ТАРИФЫ ---
 
 class ServicePlan(Base):
-    """Тарифные планы: Silver, Gold, Elite"""
+    """
+    Тарифные планы. Один план = один период одного уровня.
+    Например: Silver 1м, Silver 3м, Silver 6м — это три разных записи с tier_level=1.
+
+    price          — базовая цена ЗА МЕСЯЦ в рублях
+    months         — на сколько месяцев этот план (1, 3, 6...)
+    discount_percent — скидка в % которая применяется к итоговой сумме
+    
+    Итоговая сумма считается так:
+        base  = price * months
+        final = base * (1 - discount_percent / 100)
+    """
     __tablename__ = "service_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(50))
-    tier_level: Mapped[int] = mapped_column(default=1)    # Уровень серверов
-    price: Mapped[float] = mapped_column(Float)            # Цена
-    max_sessions: Mapped[int] = mapped_column(default=3)  # Лимит устройств
-    duration_days: Mapped[int] = mapped_column(default=30)
+    name: Mapped[str] = mapped_column(String(50))           # "Silver 3 месяца" и т.д.
+    tier_level: Mapped[int] = mapped_column(default=1)      # уровень серверов (1=Silver, 2=Gold...)
+    price: Mapped[float] = mapped_column(Float)             # базовая цена за 1 месяц
+    months: Mapped[int] = mapped_column(default=1)          # период подписки в месяцах
+    discount_percent: Mapped[float] = mapped_column(Float, default=0.0)  # скидка в %
+    max_sessions: Mapped[int] = mapped_column(default=3)    # лимит одновременных устройств
+
+    # duration_days убрали — он всегда вычисляется как months * 30
+    # если нужен в коде: plan.months * 30
 
 
 class InvoiceStatus(PyEnum):
@@ -30,19 +45,28 @@ class InvoiceStatus(PyEnum):
 
 
 class Invoice(Base):
-    """Счета на оплату"""
+    """
+    Фиксирует любое движение денег.
+
+    plan_id = None      → пополнение баланса
+    plan_id = int       → покупка подписки
+    topped_up_by = None → система (покупка) или платёжка (ЮKassa)
+    topped_up_by = int  → id админа который пополнил вручную
+    """
     __tablename__ = "invoices"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"))
-    plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
+    plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("service_plans.id"), nullable=True)
+    topped_up_by: Mapped[Optional[int]] = mapped_column(ForeignKey("clients.id"), nullable=True)
     amount: Mapped[float] = mapped_column(Float)
     status: Mapped[InvoiceStatus] = mapped_column(Enum(InvoiceStatus), default=InvoiceStatus.PENDING)
-    external_id: Mapped[Optional[str]] = mapped_column(String(100))  # ID от ЮKassa/Stripe
+    external_id: Mapped[Optional[str]] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
-    client: Mapped["Client"] = relationship(back_populates="invoices")
-    plan: Mapped["ServicePlan"] = relationship()
+    client: Mapped["Client"] = relationship(back_populates="invoices", foreign_keys="Invoice.client_id")
+    admin: Mapped[Optional["Client"]] = relationship(foreign_keys="Invoice.topped_up_by")
+    plan: Mapped[Optional["ServicePlan"]] = relationship()
 
 
 # --- ПОЛЬЗОВАТЕЛИ ---
@@ -54,14 +78,13 @@ class Client(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(unique=True, nullable=False)
     password: Mapped[str] = mapped_column(nullable=False)
-    is_admin: Mapped[bool] = mapped_column(default=False)         # нужен для deps.py
+    is_admin: Mapped[bool] = mapped_column(default=False)
     balance: Mapped[float] = mapped_column(default=0.0)
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True)
 
-    # Связи
     refresh_tokens: Mapped[List["RefreshToken"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     configs: Mapped[List["Config"]] = relationship(back_populates="owner")
-    invoices: Mapped[List["Invoice"]] = relationship(back_populates="client")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="client", foreign_keys="Invoice.client_id")
     notifications: Mapped[List["Notification"]] = relationship(back_populates="client")
 
 
@@ -85,14 +108,13 @@ class VPNServer(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(50))
     country_code: Mapped[str] = mapped_column(String(5), default="DE")
-    tier_level: Mapped[int] = mapped_column(default=1)  # 1-обычный, 2-быстрый и т.д.
+    tier_level: Mapped[int] = mapped_column(default=1)
     ip_address: Mapped[str] = mapped_column(unique=True)
-    ssh_port: Mapped[int] = mapped_column(default=22)   # на случай нестандартного порта
+    ssh_port: Mapped[int] = mapped_column(default=22)
 
-    # Доступы к API Marzban (зашифрованы через crypto_service)
     marzban_port: Mapped[int] = mapped_column(default=8000)
-    mar_admin_user: Mapped[str] = mapped_column()
-    mar_admin_pass: Mapped[str] = mapped_column()
+    mar_admin_user: Mapped[str] = mapped_column()           # зашифровано через crypto_service
+    mar_admin_pass: Mapped[str] = mapped_column()           # зашифровано через crypto_service
 
     current_users_count: Mapped[int] = mapped_column(default=0)
     is_active: Mapped[bool] = mapped_column(default=True)
@@ -101,7 +123,12 @@ class VPNServer(Base):
 
 
 class Config(Base):
-    """Подписка клиента — персональное шифрование"""
+    """
+    Активная подписка клиента.
+    Одна запись = один активный VPN-аккаунт на одном сервере.
+    marzban_username — под этим именем клиент зарегистрирован в Marzban на сервере server_id
+    subscription_url — ссылка/QR-код который клиент добавляет в VPN-приложение
+    """
     __tablename__ = "configs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -109,11 +136,10 @@ class Config(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey("vpn_servers.id"))
     plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
 
-    marzban_username: Mapped[str] = mapped_column(String(100), unique=True)  # имя юзера в Marzban
-    subscription_url: Mapped[Optional[str]] = mapped_column(Text)            # ссылка для QR-кода
+    marzban_username: Mapped[str] = mapped_column(String(100), unique=True)
+    subscription_url: Mapped[Optional[str]] = mapped_column(Text)
     activation_code: Mapped[str] = mapped_column(String(50), unique=True)
 
-    # Логика работы
     expire_at: Mapped[datetime] = mapped_column()
     auto_renew: Mapped[bool] = mapped_column(default=False)
     is_active: Mapped[bool] = mapped_column(default=True)
@@ -130,10 +156,10 @@ class Promocode(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(unique=True)
-    value: Mapped[float] = mapped_column()                                        # Сколько денег дарит
+    value: Mapped[float] = mapped_column()              # сколько рублей дарит
     max_usages: Mapped[int] = mapped_column(default=1)
     current_usages: Mapped[int] = mapped_column(default=0)
-    expires_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)         # Срок действия
+    expires_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
 
 class Notification(Base):
