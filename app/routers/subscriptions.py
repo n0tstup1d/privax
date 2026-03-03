@@ -1,3 +1,5 @@
+import json
+import secrets
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -6,60 +8,45 @@ from uuid import uuid4
 
 from auth.deps import get_current_user
 from database.database import get_db
-from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus
+from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus, TrustedDomain
 from app.services.marzban_service import create_marzban_user
 from app.services.crypto_service import decrypt
 from app.services.ssh_service import check_and_get_marzban_token
+from app.services.link_generator import generate_short_id, generate_sub_token, generate_vless_link
+from app.services.marzban_configurator import add_short_id_to_server
 
 router = APIRouter()
 
 
 def _calc_final_price(plan: ServicePlan) -> float:
-    """
-    Считает итоговую цену подписки с учётом скидки.
-    
-    Например:
-        plan.price = 299 (за месяц)
-        plan.months = 3
-        plan.discount_percent = 10
-        
-        base  = 299 * 3 = 897
-        final = 897 * (1 - 10/100) = 807.30
-    """
     base = plan.price * plan.months
     return round(base * (1 - plan.discount_percent / 100), 2)
 
 
 async def _find_working_server(tier_level: int, db: AsyncSession) -> VPNServer:
-    """
-    Находит рабочий сервер нужного уровня.
-    
-    Алгоритм:
-    1. Берём все активные серверы нужного tier, сортируем по загрузке (меньше юзеров = первый)
-    2. Идём по списку и проверяем каждый "вживую"
-    3. Первый рабочий — возвращаем
-    4. Нерабочий — помечаем is_active=False в БД и идём дальше
-    5. Если все недоступны — бросаем исключение
-    
-    Почему проверяем вживую, а не доверяем флагу is_active?
-    Сервер мог упасть в любой момент — флаг в БД этого не знает.
-    Реальная проверка гарантирует что клиент получит рабочий сервер.
-    """
-    result = await db.execute(
+    active_q = await db.execute(
         select(VPNServer)
         .where(VPNServer.tier_level == tier_level, VPNServer.is_active == True)
         .order_by(VPNServer.current_users_count.asc())
     )
-    servers = result.scalars().all()
+    active_servers = active_q.scalars().all()
 
-    if not servers:
-        raise HTTPException(
-            status_code=503,
-            detail="Нет доступных серверов для этого тарифа. Попробуйте позже."
-        )
+    if not active_servers:
+        raise HTTPException(status_code=503, detail="Нет активных серверов для этого тарифа.")
 
-    for server in servers:
-        # Расшифровываем credentials для проверки
+    inactive_q = await db.execute(
+        select(VPNServer)
+        .where(VPNServer.tier_level == tier_level, VPNServer.is_active == False)
+        .order_by(VPNServer.current_users_count.asc())
+    )
+    inactive_servers = inactive_q.scalars().all()
+
+    candidates = list(active_servers) + list(inactive_servers)
+
+    for server in candidates:
+        if server.current_users_count >= server.max_users:
+            continue
+
         admin_user = decrypt(server.mar_admin_user)
         admin_pass = decrypt(server.mar_admin_pass)
 
@@ -72,18 +59,18 @@ async def _find_working_server(tier_level: int, db: AsyncSession) -> VPNServer:
         )
 
         if check["success"]:
-            return server  # нашли рабочий — возвращаем
+            if not server.is_active:
+                server.is_active = True
+                await db.flush()
+            return server
         else:
-            # Сервер не отвечает — помечаем как неактивный
-            # Администратор увидит это в панели и разберётся
             server.is_active = False
-            await db.flush()  # сохраняем изменение но не коммитим ещё
+            await db.flush()
 
-    # Все серверы оказались недоступны
-    await db.commit()  # фиксируем все is_active=False
+    await db.commit()
     raise HTTPException(
         status_code=503,
-        detail="Все серверы этого уровня временно недоступны. Мы уже знаем об этом."
+        detail="Все серверы этого тарифа переполнены или временно недоступны."
     )
 
 
@@ -91,10 +78,6 @@ async def _find_working_server(tier_level: int, db: AsyncSession) -> VPNServer:
 
 @router.get("/plans")
 async def get_available_plans(db: AsyncSession = Depends(get_db)):
-    """
-    Возвращает все планы с финальной ценой.
-    Публичный эндпоинт — авторизация не нужна, клиент смотрит планы до покупки.
-    """
     result = await db.execute(
         select(ServicePlan).order_by(ServicePlan.tier_level, ServicePlan.months)
     )
@@ -122,53 +105,69 @@ async def buy_subscription(
     current_user: Client = Depends(get_current_user)
 ):
     """
-    Покупка подписки. Основной эндпоинт всего проекта.
-    
-    Что происходит по шагам:
-    1. Проверяем что план существует
-    2. Считаем итоговую цену
-    3. Проверяем баланс клиента
-    4. Находим рабочий сервер (с реальной проверкой)
-    5. Создаём юзера в Marzban → получаем subscription_url
-    6. Создаём Config в БД
-    7. Создаём Invoice (PAID) в БД
-    8. Списываем деньги с баланса
-    9. Увеличиваем счётчик юзеров на сервере
-    10. Возвращаем subscription_url клиенту
+    Покупка подписки.
+
+    Шаги:
+    1.  Проверяем план
+    2.  Считаем цену
+    3.  Проверяем баланс
+    4.  Находим рабочий сервер
+    5.  Генерируем уникальные параметры клиента:
+            marzban_username, short_id, sub_token
+    6.  Добавляем short_id в конфиг Xray на сервере
+    7.  Создаём юзера в Marzban → получаем user_uuid
+    8.  Сохраняем Config в БД
+    9.  Создаём Invoice
+    10. Списываем баланс, увеличиваем счётчик
+    11. Возвращаем клиенту /sub/{token}
     """
 
-    # Шаг 1 — получаем план
+    # Шаг 1
     result = await db.execute(select(ServicePlan).where(ServicePlan.id == plan_id))
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Тариф не найден")
 
-    # Шаг 2 — считаем цену
+    # Шаг 2
     final_price = _calc_final_price(plan)
 
-    # Шаг 3 — проверяем баланс
+    # Шаг 3
     if current_user.balance < final_price:
         raise HTTPException(
-            status_code=402,  # 402 = Payment Required — специально для этого случая
+            status_code=402,
             detail=f"Недостаточно средств. Нужно: {final_price}₽, у вас: {current_user.balance}₽"
         )
 
-    # Шаг 4 — ищем рабочий сервер
-    # Эта функция сама бросит HTTPException если серверов нет
+    # Шаг 4
     server = await _find_working_server(plan.tier_level, db)
-
-    # Шаг 5 — придумываем уникальное имя для юзера в Marzban
-    # Формат: privax_{client_id}_{4 символа uuid}
-    # Пример: privax_42_a3f9
-    short_uuid = uuid4().hex[:4]
-    marzban_username = f"privax_{current_user.id}_{short_uuid}"
-
-    expire_days = plan.months * 30
-
-    # Шаг 6 — создаём юзера в Marzban
     admin_user = decrypt(server.mar_admin_user)
     admin_pass = decrypt(server.mar_admin_pass)
 
+    # Шаг 5 — генерируем уникальные параметры клиента
+    short_uuid = uuid4().hex[:4]
+    marzban_username = f"privax_{current_user.id}_{short_uuid}"
+    short_id = generate_short_id()      # личный 16-символьный HEX shortId
+    sub_token = generate_sub_token()    # 64-символьный токен для /sub/
+
+    expire_days = plan.months * 30
+
+    # Шаг 6 — добавляем short_id клиента в конфиг Xray на сервере
+    # Xray должен знать этот shortId иначе соединение отклонит
+    add_result = await add_short_id_to_server(
+        ip=server.ip_address,
+        ssh_port=server.ssh_port,
+        marzban_port=server.marzban_port,
+        mar_admin_user=admin_user,
+        mar_admin_pass=admin_pass,
+        new_short_id=short_id
+    )
+    if not add_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось настроить сервер: {add_result['error']}"
+        )
+
+    # Шаг 7 — создаём юзера в Marzban
     marzban_result = await create_marzban_user(
         ip=server.ip_address,
         ssh_port=server.ssh_port,
@@ -180,30 +179,60 @@ async def buy_subscription(
     )
 
     if not marzban_result["success"]:
+        # Откатываем shortId если юзера создать не удалось
+        await add_short_id_to_server(
+            ip=server.ip_address,
+            ssh_port=server.ssh_port,
+            marzban_port=server.marzban_port,
+            mar_admin_user=admin_user,
+            mar_admin_pass=admin_pass,
+            new_short_id=None,
+            remove_short_id=short_id    # убираем добавленный shortId
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось создать VPN конфигурацию: {marzban_result['error']}"
         )
 
-    subscription_url = marzban_result["subscription_url"]
+    user_uuid = marzban_result.get("user_uuid")
+    subscription_url = marzban_result.get("subscription_url")
 
-    # Шаг 7 — считаем дату истечения подписки
     expire_at = datetime.utcnow() + timedelta(days=expire_days)
 
-    # Шаг 8 — создаём Config в БД
+    # Генерируем VLESS Reality ссылку
+    # server_names хранится как JSON в БД — парсим в список доменов
+    sni_domains = json.loads(server.server_names or "[]")
+    public_key = server.reality_public_key
+
+    vless_link = None
+    if user_uuid and public_key and sni_domains:
+        vless_link = generate_vless_link(
+            user_uuid=user_uuid,
+            server_ip=server.ip_address,
+            public_key=public_key,
+            short_id=short_id,
+            sni_domains=sni_domains,
+            label=server.name
+        )
+
+    # Шаг 8 — сохраняем Config
     new_config = Config(
         client_id=current_user.id,
         server_id=server.id,
         plan_id=plan.id,
         marzban_username=marzban_username,
+        user_uuid=user_uuid,
         subscription_url=subscription_url,
-        activation_code=uuid4().hex,    # уникальный код — пригодится позже
+        vless_link=vless_link,
+        activation_code=uuid4().hex,
+        reality_short_id=short_id,
+        sub_token=sub_token,
         expire_at=expire_at,
         is_active=True
     )
     db.add(new_config)
 
-    # Шаг 9 — создаём инвойс (уже PAID, т.к. баланс списали здесь же)
+    # Шаг 9
     invoice = Invoice(
         client_id=current_user.id,
         plan_id=plan.id,
@@ -212,20 +241,26 @@ async def buy_subscription(
     )
     db.add(invoice)
 
-    # Шаг 10 — списываем деньги и увеличиваем счётчик сервера
+    # Шаг 10 — списываем деньги, обновляем счётчики
     current_user.balance -= final_price
     server.current_users_count += 1
 
+    # Обновляем список shortIds сервера в нашей БД
+    current_ids = json.loads(server.reality_short_ids or "[]")
+    current_ids.append(short_id)
+    server.reality_short_ids = json.dumps(current_ids)
+
     await db.commit()
 
-    # Возвращаем клиенту всё что ему нужно
+    # Шаг 11
     return {
         "status": "Подписка активирована!",
-        "subscription_url": subscription_url,   # вставить в AmneziaVPN
+        "sub_url": f"/sub/{sub_token}",
         "expires_at": expire_at.isoformat(),
         "server": server.name,
         "plan": plan.name,
-        "amount_paid": final_price
+        "amount_paid": final_price,
+        "note": "Вставьте sub_url в AmneziaVPN — ссылка обновляется автоматически"
     }
 
 
@@ -234,24 +269,20 @@ async def get_my_subscriptions(
     db: AsyncSession = Depends(get_db),
     current_user: Client = Depends(get_current_user)
 ):
-    """
-    Возвращает все активные подписки клиента.
-    
-    Это и есть тот эндпоинт который вызывается при логине —
-    приложение получает subscription_url и предлагает добавить в AmneziaVPN.
-    """
     result = await db.execute(
         select(Config)
-        .where(Config.client_id == current_user.id, Config.is_active == True)
+        .where(Config.client_id == current_user.id)
         .order_by(Config.expire_at.desc())
     )
     configs = result.scalars().all()
 
+    now = datetime.utcnow()
     return [
         {
             "id": c.id,
-            "subscription_url": c.subscription_url,  # главное что нужно клиенту
+            "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
             "expires_at": c.expire_at.isoformat(),
+            "expired": c.expire_at < now,
             "is_active": c.is_active,
             "auto_renew": c.auto_renew,
         }

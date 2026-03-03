@@ -74,6 +74,7 @@ class VPNServerCreate(BaseModel):
     mar_admin_pass: str
     country_code: str = "DE"
     marzban_port: int = 8000
+    max_users: int = 10  # лимит: сколько юзеров можно посадить на этот сервер
 
 
 class VPNServerUpdate(BaseModel):
@@ -95,10 +96,20 @@ class VPNServerResponse(BaseModel):
     country_code: str
     tier_level: int
     ssh_port: int
-    marzban_port: int
     mar_admin_user: str
-    current_users_count: int
+    current_users_count: int     # сколько юзеров сейчас
+    max_users: int               # лимит сервера
+    marzban_port: int
     is_active: bool
 
     class Config:
         from_attributes = True
+    
+class DomainCreate(BaseModel):
+    domain: str
+    country_code: Optional[str] = None  # None = глобальный
+
+class DomainUpdate(BaseModel):
+    domain: Optional[str] = None
+    country_code: Optional[str] = None
+    is_active: Optional[bool] = None

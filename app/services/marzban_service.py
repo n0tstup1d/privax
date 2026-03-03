@@ -120,12 +120,22 @@ async def create_marzban_user(
                     expire_timestamp = int((datetime.utcnow() + timedelta(days=expire_days)).timestamp())
 
                     # Шаг 4 — создаём пользователя
+                    # proxies: для vless обязательно указываем flow=xtls-rprx-vision
+                    # Без этого Reality работает, но XTLS Vision не активен —
+                    # трафик хуже скрыт от DPI
+                    proxies = {}
+                    for proto in inbounds.keys():
+                        if proto == "vless":
+                            proxies[proto] = {"flow": "xtls-rprx-vision"}
+                        else:
+                            proxies[proto] = {}
+
                     payload = {
                         "username": marzban_username,
-                        "proxies": {proto: {} for proto in inbounds.keys()},  # {"vless": {}, "vmess": {}}
-                        "inbounds": inbounds,           # все инбаунды сервера
+                        "proxies": proxies,
+                        "inbounds": inbounds,
                         "expire": expire_timestamp,
-                        "data_limit": 0,                # безлимитный трафик
+                        "data_limit": 0,
                         "data_limit_reset_strategy": "no_reset",
                         "status": "active"
                     }
@@ -142,6 +152,7 @@ async def create_marzban_user(
                     data = response.json()
                     return {
                         "success": True,
+                        "user_uuid": data.get("proxies", {}).get("vless", {}).get("id"),  # UUID из Marzban
                         "subscription_url": data.get("subscription_url")
                     }
 

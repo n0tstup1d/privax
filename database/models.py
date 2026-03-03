@@ -116,8 +116,14 @@ class VPNServer(Base):
     mar_admin_user: Mapped[str] = mapped_column()           # зашифровано через crypto_service
     mar_admin_pass: Mapped[str] = mapped_column()           # зашифровано через crypto_service
 
-    current_users_count: Mapped[int] = mapped_column(default=0)
+    current_users_count: Mapped[int] = mapped_column(default=0)   # текущее кол-во активных юзеров
+    max_users: Mapped[int] = mapped_column(default=100)            # лимит — сколько юзеров можно посадить
     is_active: Mapped[bool] = mapped_column(default=True)
+
+    # Reality параметры — заполняются автоматически при добавлении сервера
+    reality_public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reality_short_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # JSON: ["id1", "id2"]
+    server_names: Mapped[Optional[str]] = mapped_column(Text, nullable=True)         # JSON: ["domain1", "domain2"]
 
     configs: Mapped[List["Config"]] = relationship(back_populates="server")
 
@@ -137,8 +143,14 @@ class Config(Base):
     plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
 
     marzban_username: Mapped[str] = mapped_column(String(100), unique=True)
-    subscription_url: Mapped[Optional[str]] = mapped_column(Text)
+    user_uuid: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)        # UUID юзера в Marzban
+    subscription_url: Mapped[Optional[str]] = mapped_column(Text)                       # запасная ссылка от Marzban
+    vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)              # готовая VLESS Reality ссылка
     activation_code: Mapped[str] = mapped_column(String(50), unique=True)
+
+    # Reality параметры этого конкретного клиента
+    reality_short_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # личный shortId
+    sub_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)  # токен для /sub/{token}
 
     expire_at: Mapped[datetime] = mapped_column()
     auto_renew: Mapped[bool] = mapped_column(default=False)
@@ -148,6 +160,18 @@ class Config(Base):
     server: Mapped["VPNServer"] = relationship(back_populates="configs")
     plan: Mapped["ServicePlan"] = relationship()
 
+
+# --- ДОМЕНЫ-МАСКИ ---
+
+class TrustedDomain(Base):
+    __tablename__ = "trusted_domains"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    domain: Mapped[str] = mapped_column(String(255), unique=True)
+    country_code: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)  # NULL = глобальный
+    is_active: Mapped[bool] = mapped_column(default=True)
+    added_by: Mapped[Optional[int]] = mapped_column(ForeignKey("clients.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
 # --- МАРКЕТИНГ И УВЕДОМЛЕНИЯ ---
 
@@ -173,4 +197,4 @@ class Notification(Base):
     is_read: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
-    client: Mapped["Client"] = relationship(back_populates="notifications")
+    client: Mapped["Client"] = relationship(back_populates="notifications") 

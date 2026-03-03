@@ -1,134 +1,213 @@
 from fastapi import APIRouter, Depends, HTTPException
-from auth.deps import get_current_admin
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from schemas import VPNServerCreate, VPNServerUpdate, VPNServerResponse
+from sqlalchemy import select, or_
+import json
+
 from database.database import get_db
-from database.models import VPNServer
-from app.services.ssh_service import check_and_get_marzban_token
-from app.services.crypto_service import encrypt, decrypt
-from typing import List
+from database.models import VPNServer, TrustedDomain
+from schemas import VPNServerCreate, VPNServerUpdate, VPNServerResponse
+from auth.deps import get_current_admin
+from app.services.marzban_configurator import configure_server
+from app.services.crypto_service import decrypt, encrypt
 
 router = APIRouter()
 
 
-@router.post("/servers/add", dependencies=[Depends(get_current_admin)])
-async def add_vpn_server(body: VPNServerCreate, db: AsyncSession = Depends(get_db)):
-
-    # 1. Проверяем нет ли уже сервера с таким IP
-    existing = await db.execute(select(VPNServer).where(VPNServer.ip_address == body.ip_address))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Этот сервер уже есть в базе")
-
-    # 2. Проверяем что сервер живой и Marzban отвечает
-    result = await check_and_get_marzban_token(
-        ip=body.ip_address,
-        ssh_port=body.ssh_port,
-        marzban_port=body.marzban_port,
-        username=body.mar_admin_user,
-        password=body.mar_admin_pass
+async def _get_domains(db: AsyncSession, country_code: str) -> list[str]:
+    result = await db.execute(
+        select(TrustedDomain).where(
+            TrustedDomain.is_active == True,
+            or_(
+                TrustedDomain.country_code == country_code,
+                TrustedDomain.country_code.is_(None)  # NULL == None не работает в SQL
+            )
+        )
     )
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["error"])
+    return [d.domain for d in result.scalars().all()]
 
-    # 3. Шифруем чувствительные данные перед сохранением
-    new_server = VPNServer(
+
+@router.post("/servers/add", response_model=VPNServerResponse)
+async def add_server(
+    body: VPNServerCreate,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
+    existing = await db.execute(
+        select(VPNServer).where(VPNServer.ip_address == body.ip_address)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Сервер с таким IP уже существует")
+
+    server = VPNServer(
         name=body.name,
-        ip_address=body.ip_address,
         country_code=body.country_code,
         tier_level=body.tier_level,
-        marzban_port=body.marzban_port,
+        ip_address=body.ip_address,
         ssh_port=body.ssh_port,
+        marzban_port=body.marzban_port,
         mar_admin_user=encrypt(body.mar_admin_user),
         mar_admin_pass=encrypt(body.mar_admin_pass),
+        current_users_count=0,
+        max_users=body.max_users,
+        is_active=False,  # по умолчанию неактивен до успешной настройки
     )
-
-    db.add(new_server)
+    db.add(server)
     await db.commit()
-    await db.refresh(new_server)
+    await db.refresh(server)
 
-    return {"status": "Сервер добавлен в сеть Privax", "server_id": new_server.id}
+    domains = await _get_domains(db, server.country_code)
+
+    if not domains:
+        raise HTTPException(
+            status_code=400,
+            detail="Сервер добавлен в БД со статусом неактивен. Сначала добавьте домены через /admin/domains, затем вызовите /reconfigure"
+        )
+
+    try:
+        config_result = await configure_server(
+            ip=server.ip_address,
+            ssh_port=server.ssh_port,
+            marzban_port=server.marzban_port,
+            mar_admin_user=decrypt(server.mar_admin_user),
+            mar_admin_pass=decrypt(server.mar_admin_pass),
+            trusted_domains=domains,
+            current_users_count=server.max_users
+        )
+
+        if not config_result.get("success"):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Сервер добавлен в БД, но настройка не удалась: {config_result.get('error')}"
+            )
+
+        server.reality_public_key = config_result.get("public_key")
+        server.reality_short_ids  = json.dumps(config_result.get("short_ids", []))
+        server.server_names        = json.dumps(config_result.get("server_names", []))
+        server.is_active = True
+
+        await db.commit()
+        await db.refresh(server)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Сервер добавлен в БД, но подключиться не удалось: {str(e)}"
+        )
+
+    return server
 
 
-@router.get("/servers", dependencies=[Depends(get_current_admin)], response_model=List[VPNServerResponse])
-async def get_servers(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(VPNServer).order_by(VPNServer.tier_level))
-    servers = result.scalars().all()
-
-    # Расшифровываем для отображения админу
-    response = []
-    for s in servers:
-        response.append(VPNServerResponse(
-            id=s.id,
-            name=s.name,
-            ip_address=s.ip_address,
-            country_code=s.country_code,
-            tier_level=s.tier_level,
-            ssh_port=s.ssh_port,
-            marzban_port=s.marzban_port,
-            mar_admin_user=decrypt(s.mar_admin_user),
-            current_users_count=s.current_users_count,
-            is_active=s.is_active
-        ))
-    return response
+@router.get("/servers", response_model=list[VPNServerResponse])
+async def list_servers(
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
+    result = await db.execute(select(VPNServer).order_by(VPNServer.id))
+    return result.scalars().all()
 
 
-@router.patch("/servers/{server_id}", dependencies=[Depends(get_current_admin)])
-async def update_server(server_id: int, body: VPNServerUpdate, db: AsyncSession = Depends(get_db)):
+@router.get("/servers/{server_id}", response_model=VPNServerResponse)
+async def get_server(
+    server_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
     result = await db.execute(select(VPNServer).where(VPNServer.id == server_id))
     server = result.scalar_one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="Сервер не найден")
+    return server
 
+
+@router.patch("/servers/{server_id}", response_model=VPNServerResponse)
+async def update_server(
+    server_id: int,
+    body: VPNServerUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
+    result = await db.execute(select(VPNServer).where(VPNServer.id == server_id))
+    server = result.scalar_one_or_none()
     if not server:
         raise HTTPException(status_code=404, detail="Сервер не найден")
 
-    update_data = body.model_dump(exclude_none=True)
+    data = body.model_dump(exclude_unset=True)
 
-    # Если меняются данные подключения — проверяем соединение с новыми данными
-    connection_fields = {"ip_address", "ssh_port", "marzban_port", "mar_admin_user", "mar_admin_pass"}
-    if connection_fields & update_data.keys():
+    # Поля которые нужно шифровать перед сохранением
+    if "mar_admin_user" in data:
+        data["mar_admin_user"] = encrypt(data["mar_admin_user"])
+    if "mar_admin_pass" in data:
+        data["mar_admin_pass"] = encrypt(data["mar_admin_pass"])
 
-        # Берём актуальные значения — новые если пришли, старые если нет
-        check_ip           = update_data.get("ip_address",     server.ip_address)
-        check_ssh_port     = update_data.get("ssh_port",       server.ssh_port)
-        check_marzban_port = update_data.get("marzban_port",   server.marzban_port)
-        check_user         = update_data.get("mar_admin_user", decrypt(server.mar_admin_user))
-        check_pass         = update_data.get("mar_admin_pass", decrypt(server.mar_admin_pass))
-
-        check = await check_and_get_marzban_token(
-            ip=check_ip,
-            ssh_port=check_ssh_port,
-            marzban_port=check_marzban_port,
-            username=check_user,
-            password=check_pass,
-            
-        )
-        if not check["success"]:
-            raise HTTPException(status_code=400, detail=f"Проверка соединения не прошла: {check['error']}")
-
-    # Шифруем credentials перед сохранением
-    if "mar_admin_user" in update_data:
-        update_data["mar_admin_user"] = encrypt(update_data["mar_admin_user"])
-    if "mar_admin_pass" in update_data:
-        update_data["mar_admin_pass"] = encrypt(update_data["mar_admin_pass"])
-
-    for field, value in update_data.items():
+    for field, value in data.items():
         setattr(server, field, value)
 
     await db.commit()
-    return {"status": "Сервер обновлён"}
+    await db.refresh(server)
+    return server
 
 
-@router.delete("/servers/{server_id}", dependencies=[Depends(get_current_admin)])
-async def delete_server(server_id: int, db: AsyncSession = Depends(get_db)):
+@router.post("/servers/{server_id}/reconfigure", response_model=VPNServerResponse)
+async def reconfigure_server(
+    server_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
     result = await db.execute(select(VPNServer).where(VPNServer.id == server_id))
     server = result.scalar_one_or_none()
-
     if not server:
         raise HTTPException(status_code=404, detail="Сервер не найден")
 
-    if server.current_users_count > 0:
-        raise HTTPException(status_code=400, detail="Нельзя удалить сервер с активными пользователями")
+    domains = await _get_domains(db, server.country_code)
+    if not domains:
+        raise HTTPException(
+            status_code=400,
+            detail="Нет доменов-масок. Добавьте домены через /admin/domains"
+        )
+
+    try:
+        config_result = await configure_server(
+            ip=server.ip_address,
+            ssh_port=server.ssh_port,
+            marzban_port=server.marzban_port,
+            mar_admin_user=decrypt(server.mar_admin_user),
+            mar_admin_pass=decrypt(server.mar_admin_pass),
+            trusted_domains=domains,
+            current_users_count=server.max_users
+        )
+
+        if not config_result.get("success"):
+            raise HTTPException(status_code=503, detail=f"Перенастройка не удалась: {config_result.get('error')}")
+
+        server.reality_public_key = config_result.get("public_key")
+        server.reality_short_ids  = json.dumps(config_result.get("short_ids", []))
+        server.server_names        = json.dumps(config_result.get("server_names", []))
+        server.is_active = True
+
+        await db.commit()
+        await db.refresh(server)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Перенастройка не удалась: {str(e)}")
+
+    return server
+
+
+@router.delete("/servers/{server_id}")
+async def delete_server(
+    server_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(get_current_admin)
+):
+    result = await db.execute(select(VPNServer).where(VPNServer.id == server_id))
+    server = result.scalar_one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="Сервер не найден")
 
     await db.delete(server)
     await db.commit()
-    return {"status": "Сервер удалён"}
+    return {"detail": "Сервер удалён"}
