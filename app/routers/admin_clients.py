@@ -8,8 +8,9 @@ from datetime import datetime, timedelta
 from auth.deps import get_current_admin
 from database.database import get_db
 from database.models import Client, Config, VPNServer, ServicePlan, Invoice, InvoiceStatus
-from app.services.marzban_service import toggle_marzban_user, delete_marzban_user
+from app.services.marzban_service import toggle_marzban_user, delete_marzban_user, create_marzban_user
 from app.services.crypto_service import decrypt
+from app.services.link_generator import generate_sub_token
 
 router = APIRouter()
 
@@ -138,7 +139,7 @@ async def get_client_profile(
 
 # --- Схемы для изменения клиента ---
 class ClientUpdate(BaseModel):
-    is_admin: Optional[bool] = False
+    is_admin: Optional[bool] = None
     balance: Optional[float] = None
 
 
@@ -406,4 +407,108 @@ async def get_overview(db: AsyncSession = Depends(get_db), _=Depends(get_current
         },
         "servers": servers_data,
         "plans": plans_data,
+    }
+
+# ═══════════════════════════════════════════════
+#  ПЕРЕНОС КЛИЕНТА НА ДРУГОЙ СЕРВЕР
+# ═══════════════════════════════════════════════
+
+class MigrateConfigRequest(BaseModel):
+    target_server_id: int
+
+
+@router.post("/configs/{config_id}/migrate", dependencies=[Depends(get_current_admin)])
+async def migrate_config(
+    config_id: int,
+    body: MigrateConfigRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Переносит подписку клиента на другой сервер.
+
+    Используй когда:
+    - Текущий сервер заблокирован или перегружен
+    - Нужно балансировать нагрузку вручную
+    - Клиент жалуется на скорость
+
+    Что происходит:
+    1. Удаляем юзера со старого сервера в Marzban
+    2. Создаём юзера на новом сервере в Marzban
+    3. Обновляем Config в БД — новый сервер, новая ссылка, новый sub_token
+    4. Счётчики серверов обновляются
+    
+    Срок подписки сохраняется — клиент не теряет оплаченное время.
+    """
+    # Получаем конфиг
+    result = await db.execute(select(Config).where(Config.id == config_id))
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Подписка не найдена")
+
+    # Получаем целевой сервер
+    target_server = await db.get(VPNServer, body.target_server_id)
+    if not target_server:
+        raise HTTPException(status_code=404, detail="Целевой сервер не найден")
+
+    if not target_server.is_active:
+        raise HTTPException(status_code=400, detail="Целевой сервер неактивен")
+
+    if target_server.id == config.server_id:
+        raise HTTPException(status_code=400, detail="Клиент уже на этом сервере")
+
+    if target_server.current_users_count >= target_server.max_users:
+        raise HTTPException(status_code=400, detail="Целевой сервер заполнен")
+
+    old_server = await db.get(VPNServer, config.server_id)
+
+    # Шаг 1 — удаляем со старого сервера
+    if old_server:
+        await delete_marzban_user(
+            ip=old_server.ip_address,
+            ssh_port=old_server.ssh_port,
+            marzban_port=old_server.marzban_port,
+            mar_admin_user=decrypt(old_server.mar_admin_user),
+            mar_admin_pass=decrypt(old_server.mar_admin_pass),
+            marzban_username=config.marzban_username
+        )
+        if old_server.current_users_count > 0:
+            old_server.current_users_count -= 1
+
+    # Шаг 2 — создаём на новом сервере
+    # Считаем сколько дней осталось до конца подписки
+    days_left = max(1, (config.expire_at - datetime.utcnow()).days)
+
+    marzban_result = await create_marzban_user(
+        ip=target_server.ip_address,
+        ssh_port=target_server.ssh_port,
+        marzban_port=target_server.marzban_port,
+        mar_admin_user=decrypt(target_server.mar_admin_user),
+        mar_admin_pass=decrypt(target_server.mar_admin_pass),
+        marzban_username=config.marzban_username,
+        expire_days=days_left
+    )
+
+    if not marzban_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось создать юзера на новом сервере: {marzban_result['error']}"
+        )
+
+    # Шаг 3 — обновляем Config в БД
+    config.server_id  = target_server.id
+    config.vless_link = marzban_result.get("vless_link")
+    config.sub_token  = generate_sub_token()  # новый токен — старая ссылка становится невалидной
+
+    # Шаг 4 — обновляем счётчик нового сервера
+    target_server.current_users_count += 1
+
+    await db.commit()
+
+    return {
+        "status": "Клиент перенесён",
+        "config_id": config_id,
+        "old_server": old_server.name if old_server else "удалён",
+        "new_server": target_server.name,
+        "new_sub_url": f"/sub/{config.sub_token}",
+        "days_remaining": days_left,
     }

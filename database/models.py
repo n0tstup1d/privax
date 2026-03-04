@@ -16,10 +16,11 @@ class ServicePlan(Base):
     Тарифные планы. Один план = один период одного уровня.
     Например: Silver 1м, Silver 3м, Silver 6м — это три разных записи с tier_level=1.
 
-    price          — базовая цена ЗА МЕСЯЦ в рублях
-    months         — на сколько месяцев этот план (1, 3, 6...)
+    price            — базовая цена ЗА МЕСЯЦ в рублях
+    months           — на сколько месяцев этот план (1, 3, 6...)
     discount_percent — скидка в % которая применяется к итоговой сумме
-    
+    data_limit_gb    — лимит трафика в ГБ за весь период (0 = безлимит)
+
     Итоговая сумма считается так:
         base  = price * months
         final = base * (1 - discount_percent / 100)
@@ -33,9 +34,7 @@ class ServicePlan(Base):
     months: Mapped[int] = mapped_column(default=1)          # период подписки в месяцах
     discount_percent: Mapped[float] = mapped_column(Float, default=0.0)  # скидка в %
     max_sessions: Mapped[int] = mapped_column(default=3)    # лимит одновременных устройств
-
-    # duration_days убрали — он всегда вычисляется как months * 30
-    # если нужен в коде: plan.months * 30
+    data_limit_gb: Mapped[int] = mapped_column(default=0)   # лимит трафика в ГБ (0 = безлимит)
 
 
 class InvoiceStatus(PyEnum):
@@ -99,6 +98,42 @@ class RefreshToken(Base):
     client: Mapped["Client"] = relationship(back_populates="refresh_tokens")
 
 
+class LoginAttempt(Base):
+    """
+    Журнал неудачных попыток входа для антибрутфорс защиты.
+
+    Логика:
+        - Считаем попытки за последние BRUTE_WINDOW минут
+        - Если >= MAX_ATTEMPTS — блокируем до blocked_until
+        - После blocked_until счётчик сбрасывается автоматически
+    """
+    __tablename__ = "login_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), index=True)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    attempted_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    blocked_until: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
+
+class PasswordResetCode(Base):
+    """
+    Одноразовый 6-значный код для сброса пароля.
+    Действует RESET_TTL минут, после использования удаляется.
+    Сейчас код печатается в консоль — когда подключишь email,
+    просто замени print() на вызов email_service.
+    """
+    __tablename__ = "password_reset_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"))
+    code: Mapped[str] = mapped_column(String(6))
+    expires_at: Mapped[datetime] = mapped_column()
+    is_used: Mapped[bool] = mapped_column(default=False)
+
+    client: Mapped["Client"] = relationship()
+
+
 # --- VPN ИНФРАСТРУКТУРА ---
 
 class VPNServer(Base):
@@ -117,7 +152,7 @@ class VPNServer(Base):
     mar_admin_pass: Mapped[str] = mapped_column()           # зашифровано через crypto_service
 
     current_users_count: Mapped[int] = mapped_column(default=0)   # текущее кол-во активных юзеров
-    max_users: Mapped[int] = mapped_column(default=10)            # лимит — сколько юзеров можно посадить
+    max_users: Mapped[int] = mapped_column(default=100)            # лимит — сколько юзеров можно посадить
     is_active: Mapped[bool] = mapped_column(default=True)
 
     # Reality параметры — заполняются автоматически при добавлении сервера
@@ -171,15 +206,65 @@ class TrustedDomain(Base):
 
 # --- МАРКЕТИНГ И УВЕДОМЛЕНИЯ ---
 
+class PromocodeType(PyEnum):
+    BALANCE  = "balance"   # зачисляет рубли на баланс
+    DISCOUNT = "discount"  # скидка % при покупке подписки
+
+ 
 class Promocode(Base):
+    """
+    Промокод.
+
+    Типы:
+        balance  — зачисляет value рублей на баланс клиента
+        discount — даёт скидку discount_percent% при покупке подписки
+
+    plan_id = None  → скидка действует на любой тариф
+    plan_id = int   → скидка только на конкретный тариф
+
+    max_usages_per_client — сколько раз один клиент может использовать
+                            (1 = одноразовый для каждого, 0 = без ограничений)
+    """
     __tablename__ = "promocodes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(unique=True)
-    value: Mapped[float] = mapped_column()              # сколько рублей дарит
-    max_usages: Mapped[int] = mapped_column(default=1)
+    promo_type: Mapped[PromocodeType] = mapped_column(
+        Enum(PromocodeType), default=PromocodeType.BALANCE
+    )
+
+    # Для type=balance: сколько рублей начислить
+    value: Mapped[float] = mapped_column(default=0.0)
+
+    # Для type=discount: процент скидки и на какой план (None = все)
+    discount_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("service_plans.id"), nullable=True
+    )
+
+    max_usages: Mapped[int] = mapped_column(default=1)          # всего активаций (0 = ∞)
+    max_usages_per_client: Mapped[int] = mapped_column(default=1)  # на одного клиента (0 = ∞)
     current_usages: Mapped[int] = mapped_column(default=0)
     expires_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
+    plan: Mapped[Optional["ServicePlan"]] = relationship()
+    usages: Mapped[List["PromocodeUsage"]] = relationship(back_populates="promocode", cascade="all, delete-orphan")
+
+
+class PromocodeUsage(Base):
+    """
+    Журнал использования промокодов.
+    Нужен чтобы контролировать лимит на одного клиента.
+    """
+    __tablename__ = "promocode_usages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    promocode_id: Mapped[int] = mapped_column(ForeignKey("promocodes.id"))
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"))
+    used_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+    promocode: Mapped["Promocode"] = relationship(back_populates="usages")
+    client: Mapped["Client"] = relationship()
 
 
 class Notification(Base):

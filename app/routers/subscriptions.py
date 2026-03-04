@@ -3,10 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timedelta
 from uuid import uuid4
+from typing import Optional
+from pydantic import BaseModel
 
 from auth.deps import get_current_user
 from database.database import get_db
-from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus
+from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus, Promocode, PromocodeUsage, PromocodeType
 from app.services.marzban_service import create_marzban_user
 from app.services.crypto_service import decrypt
 from app.services.ssh_service import check_and_get_marzban_token
@@ -15,9 +17,19 @@ from app.services.link_generator import generate_sub_token
 router = APIRouter()
 
 
-def _calc_final_price(plan: ServicePlan) -> float:
+def _calc_final_price(plan: ServicePlan, extra_discount: float = 0.0) -> float:
+    """
+    Считает итоговую цену плана.
+    extra_discount — дополнительная скидка от промокода (%).
+    Скидки суммируются: plan.discount_percent + extra_discount.
+    """
+    total_discount = min(plan.discount_percent + extra_discount, 100.0)
     base = plan.price * plan.months
-    return round(base * (1 - plan.discount_percent / 100), 2)
+    return round(base * (1 - total_discount / 100), 2)
+
+
+class BuyRequest(BaseModel):
+    promocode: Optional[str] = None   # опциональный discount-промокод
 
 
 async def _find_working_server(tier_level: int, db: AsyncSession) -> VPNServer:
@@ -98,23 +110,13 @@ async def get_available_plans(db: AsyncSession = Depends(get_db)):
 @router.post("/buy/{plan_id}")
 async def buy_subscription(
     plan_id: int,
+    body: BuyRequest = BuyRequest(),
     db: AsyncSession = Depends(get_db),
     current_user: Client = Depends(get_current_user)
 ):
     """
     Покупка подписки.
-
-    Шаги:
-    1. Проверяем план
-    2. Считаем цену
-    3. Проверяем баланс
-    4. Находим рабочий сервер
-    5. Генерируем marzban_username и sub_token
-    6. Создаём юзера в Marzban → получаем готовую vless_link
-    7. Сохраняем Config в БД
-    8. Создаём Invoice
-    9. Списываем баланс, увеличиваем счётчик
-    10. Возвращаем клиенту sub_url
+    Body (опционально): {"promocode": "SAVE20"} — discount промокод.
     """
 
     # Шаг 1
@@ -123,8 +125,23 @@ async def buy_subscription(
     if not plan:
         raise HTTPException(status_code=404, detail="Тариф не найден")
 
-    # Шаг 2
-    final_price = _calc_final_price(plan)
+    # Шаг 2 — считаем цену, применяем промокод если есть
+    extra_discount = 0.0
+    applied_promo = None
+
+    if body.promocode:
+        from sqlalchemy import func
+        from app.routers.promocodes import _validate_promocode, _record_usage
+        promo = await _validate_promocode(body.promocode, current_user.id, plan_id, db)
+
+        if promo.promo_type != PromocodeType.DISCOUNT:
+            raise HTTPException(status_code=400, detail="Этот промокод не является скидочным. Используйте /promocodes/apply")
+
+        extra_discount = promo.discount_percent
+        applied_promo = promo
+
+    # Шаг 2 — итоговая цена с учётом промокода
+    final_price = _calc_final_price(plan, extra_discount)
 
     # Шаг 3
     if current_user.balance < final_price:
@@ -154,7 +171,8 @@ async def buy_subscription(
         mar_admin_user=admin_user,
         mar_admin_pass=admin_pass,
         marzban_username=marzban_username,
-        expire_days=expire_days
+        expire_days=expire_days,
+        data_limit_gb=plan.data_limit_gb
     )
 
     if not marzban_result["success"]:
@@ -192,6 +210,11 @@ async def buy_subscription(
     current_user.balance -= final_price
     server.current_users_count += 1
 
+    # Фиксируем использование промокода если был
+    if applied_promo:
+        from app.routers.promocodes import _record_usage
+        await _record_usage(applied_promo, current_user.id, db)
+
     await db.commit()
 
     # Шаг 10
@@ -202,6 +225,7 @@ async def buy_subscription(
         "server": server.name,
         "plan": plan.name,
         "amount_paid": final_price,
+        "discount_applied": extra_discount if extra_discount else None,
         "note": "Вставьте sub_url в AmneziaVPN — ссылка обновляется автоматически"
     }
 
@@ -230,3 +254,33 @@ async def get_my_subscriptions(
         }
         for c in configs
     ]
+
+
+@router.patch("/subscriptions/{config_id}/auto-renew")
+async def toggle_auto_renew(
+    config_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: Client = Depends(get_current_user)
+):
+    """
+    Включает или выключает авто-продление подписки.
+    Клиент управляет только своими подписками.
+    """
+    result = await db.execute(
+        select(Config).where(
+            Config.id == config_id,
+            Config.client_id == current_user.id   # только свои
+        )
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Подписка не найдена")
+
+    config.auto_renew = not config.auto_renew
+    await db.commit()
+
+    return {
+        "config_id": config_id,
+        "auto_renew": config.auto_renew,
+        "status": "Авто-продление включено" if config.auto_renew else "Авто-продление выключено"
+    }

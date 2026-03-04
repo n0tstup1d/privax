@@ -2,11 +2,12 @@ from fastapi import FastAPI
 from database.models import Base
 from database.database import engine
 from app.routers import auth, users, subscriptions, billing
-from app.routers.admin import server, plans, domains  
+from app.routers.admin import server, plans, domains, notifications
 from app.scheduler import start_scheduler
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import admin_clients
 from app.routers import subscription_serve
+from app.routers import promocodes
 import os
 from dotenv import load_dotenv
 
@@ -40,6 +41,8 @@ app.include_router(plans.router,             prefix="/plans",         tags=["Pla
 app.include_router(domains.router, prefix="/admin", tags=["Domains(adm)"])
 app.include_router(admin_clients.router, prefix="/admin", tags=["Admin"])
 app.include_router(subscription_serve.router, tags=["Subscriptions"])
+app.include_router(promocodes.router, prefix="/promocodes", tags=["Promocodes"])
+app.include_router(notifications.router, prefix="/admin", tags=["Notifications(adm)"])
 
 @app.get("/")
 async def root():

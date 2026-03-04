@@ -72,7 +72,8 @@ async def create_marzban_user(
     mar_admin_user: str,    # уже расшифрованный
     mar_admin_pass: str,    # уже расшифрованный
     marzban_username: str,  # имя которое мы придумали для клиента, например "privax_42"
-    expire_days: int        # на сколько дней создаём (plan.months * 30)
+    expire_days: int,       # на сколько дней создаём (plan.months * 30)
+    data_limit_gb: int = 0  # лимит трафика в ГБ (0 = безлимит)
 ) -> dict:
     """
     Создаёт пользователя в Marzban.
@@ -135,7 +136,7 @@ async def create_marzban_user(
                         "proxies": proxies,
                         "inbounds": inbounds,
                         "expire": expire_timestamp,
-                        "data_limit": 0,
+                        "data_limit": data_limit_gb * 1024 ** 3 if data_limit_gb > 0 else 0,
                         "data_limit_reset_strategy": "no_reset",
                         "status": "active"
                     }
