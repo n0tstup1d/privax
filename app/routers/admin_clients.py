@@ -86,7 +86,7 @@ async def get_client_profile(
         configs_data.append({
             "id": c.id,
             "marzban_username": c.marzban_username,
-            "subscription_url": c.subscription_url,
+            "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
             "status": "active" if c.is_active and c.expire_at > now else "expired" if c.expire_at < now else "disabled",
             "expire_at": c.expire_at.isoformat(),
             "days_left": max(0, (c.expire_at - now).days),
@@ -138,7 +138,7 @@ async def get_client_profile(
 
 # --- Схемы для изменения клиента ---
 class ClientUpdate(BaseModel):
-    is_admin: Optional[bool] = None
+    is_admin: Optional[bool] = False
     balance: Optional[float] = None
 
 

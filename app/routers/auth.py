@@ -32,7 +32,7 @@ def _serialize_config(c: Config) -> dict:
 
     return {
         "id": c.id,
-        "subscription_url": c.subscription_url,
+        "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
         "expires_at": c.expire_at.isoformat(),
         "expired": is_expired,          # True = истекла, False = активна
         "auto_renew": c.auto_renew,

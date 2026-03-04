@@ -63,4 +63,4 @@ async def delete_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
 async def get_plans(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ServicePlan).order_by(ServicePlan.tier_level))
     plans = result.scalars().all()
-    return plans
+    return [ServicePlanResponse.from_orm_with_price(p) for p in plans]

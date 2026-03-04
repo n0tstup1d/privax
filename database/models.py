@@ -117,7 +117,7 @@ class VPNServer(Base):
     mar_admin_pass: Mapped[str] = mapped_column()           # зашифровано через crypto_service
 
     current_users_count: Mapped[int] = mapped_column(default=0)   # текущее кол-во активных юзеров
-    max_users: Mapped[int] = mapped_column(default=100)            # лимит — сколько юзеров можно посадить
+    max_users: Mapped[int] = mapped_column(default=10)            # лимит — сколько юзеров можно посадить
     is_active: Mapped[bool] = mapped_column(default=True)
 
     # Reality параметры — заполняются автоматически при добавлении сервера
@@ -132,8 +132,10 @@ class Config(Base):
     """
     Активная подписка клиента.
     Одна запись = один активный VPN-аккаунт на одном сервере.
-    marzban_username — под этим именем клиент зарегистрирован в Marzban на сервере server_id
-    subscription_url — ссылка/QR-код который клиент добавляет в VPN-приложение
+
+    marzban_username — имя юзера в Marzban (нужно для удаления/отключения)
+    vless_link       — готовая ссылка от Marzban, пишется в БД как статичный снапшот
+    sub_token        — токен для /sub/{token}, через который клиент получает актуальную ссылку
     """
     __tablename__ = "configs"
 
@@ -143,13 +145,7 @@ class Config(Base):
     plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
 
     marzban_username: Mapped[str] = mapped_column(String(100), unique=True)
-    user_uuid: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)        # UUID юзера в Marzban
-    subscription_url: Mapped[Optional[str]] = mapped_column(Text)                       # запасная ссылка от Marzban
-    vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)              # готовая VLESS Reality ссылка
-    activation_code: Mapped[str] = mapped_column(String(50), unique=True)
-
-    # Reality параметры этого конкретного клиента
-    reality_short_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # личный shortId
+    vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # ссылка от Marzban
     sub_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)  # токен для /sub/{token}
 
     expire_at: Mapped[datetime] = mapped_column()
@@ -197,4 +193,4 @@ class Notification(Base):
     is_read: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
-    client: Mapped["Client"] = relationship(back_populates="notifications") 
+    client: Mapped["Client"] = relationship(back_populates="notifications")

@@ -1,5 +1,3 @@
-import json
-import secrets
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -8,12 +6,11 @@ from uuid import uuid4
 
 from auth.deps import get_current_user
 from database.database import get_db
-from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus, TrustedDomain
+from database.models import Client, ServicePlan, VPNServer, Config, Invoice, InvoiceStatus
 from app.services.marzban_service import create_marzban_user
 from app.services.crypto_service import decrypt
 from app.services.ssh_service import check_and_get_marzban_token
-from app.services.link_generator import generate_short_id, generate_sub_token, generate_vless_link
-from app.services.marzban_configurator import add_short_id_to_server
+from app.services.link_generator import generate_sub_token
 
 router = APIRouter()
 
@@ -108,18 +105,16 @@ async def buy_subscription(
     Покупка подписки.
 
     Шаги:
-    1.  Проверяем план
-    2.  Считаем цену
-    3.  Проверяем баланс
-    4.  Находим рабочий сервер
-    5.  Генерируем уникальные параметры клиента:
-            marzban_username, short_id, sub_token
-    6.  Добавляем short_id в конфиг Xray на сервере
-    7.  Создаём юзера в Marzban → получаем user_uuid
-    8.  Сохраняем Config в БД
-    9.  Создаём Invoice
-    10. Списываем баланс, увеличиваем счётчик
-    11. Возвращаем клиенту /sub/{token}
+    1. Проверяем план
+    2. Считаем цену
+    3. Проверяем баланс
+    4. Находим рабочий сервер
+    5. Генерируем marzban_username и sub_token
+    6. Создаём юзера в Marzban → получаем готовую vless_link
+    7. Сохраняем Config в БД
+    8. Создаём Invoice
+    9. Списываем баланс, увеличиваем счётчик
+    10. Возвращаем клиенту sub_url
     """
 
     # Шаг 1
@@ -143,31 +138,15 @@ async def buy_subscription(
     admin_user = decrypt(server.mar_admin_user)
     admin_pass = decrypt(server.mar_admin_pass)
 
-    # Шаг 5 — генерируем уникальные параметры клиента
+    # Шаг 5
     short_uuid = uuid4().hex[:4]
     marzban_username = f"privax_{current_user.id}_{short_uuid}"
-    short_id = generate_short_id()      # личный 16-символьный HEX shortId
-    sub_token = generate_sub_token()    # 64-символьный токен для /sub/
-
+    sub_token = generate_sub_token()
     expire_days = plan.months * 30
 
-    # Шаг 6 — добавляем short_id клиента в конфиг Xray на сервере
-    # Xray должен знать этот shortId иначе соединение отклонит
-    add_result = await add_short_id_to_server(
-        ip=server.ip_address,
-        ssh_port=server.ssh_port,
-        marzban_port=server.marzban_port,
-        mar_admin_user=admin_user,
-        mar_admin_pass=admin_pass,
-        new_short_id=short_id
-    )
-    if not add_result["success"]:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Не удалось настроить сервер: {add_result['error']}"
-        )
-
-    # Шаг 7 — создаём юзера в Marzban
+    # Шаг 6 — создаём юзера в Marzban и сразу получаем готовую ссылку.
+    # Marzban сам формирует vless_link со всеми параметрами включая spx и flow,
+    # при условии что SpiderX прописан в конфиге сервера (через /server/configure).
     marzban_result = await create_marzban_user(
         ip=server.ip_address,
         ssh_port=server.ssh_port,
@@ -179,60 +158,28 @@ async def buy_subscription(
     )
 
     if not marzban_result["success"]:
-        # Откатываем shortId если юзера создать не удалось
-        await add_short_id_to_server(
-            ip=server.ip_address,
-            ssh_port=server.ssh_port,
-            marzban_port=server.marzban_port,
-            mar_admin_user=admin_user,
-            mar_admin_pass=admin_pass,
-            new_short_id=None,
-            remove_short_id=short_id    # убираем добавленный shortId
-        )
         raise HTTPException(
             status_code=500,
             detail=f"Не удалось создать VPN конфигурацию: {marzban_result['error']}"
         )
 
-    user_uuid = marzban_result.get("user_uuid")
-    subscription_url = marzban_result.get("subscription_url")
-
+    vless_link = marzban_result.get("vless_link")
     expire_at = datetime.utcnow() + timedelta(days=expire_days)
 
-    # Генерируем VLESS Reality ссылку
-    # server_names хранится как JSON в БД — парсим в список доменов
-    sni_domains = json.loads(server.server_names or "[]")
-    public_key = server.reality_public_key
-
-    vless_link = None
-    if user_uuid and public_key and sni_domains:
-        vless_link = generate_vless_link(
-            user_uuid=user_uuid,
-            server_ip=server.ip_address,
-            public_key=public_key,
-            short_id=short_id,
-            sni_domains=sni_domains,
-            label=server.name
-        )
-
-    # Шаг 8 — сохраняем Config
+    # Шаг 7 — сохраняем Config
     new_config = Config(
         client_id=current_user.id,
         server_id=server.id,
         plan_id=plan.id,
         marzban_username=marzban_username,
-        user_uuid=user_uuid,
-        subscription_url=subscription_url,
         vless_link=vless_link,
-        activation_code=uuid4().hex,
-        reality_short_id=short_id,
         sub_token=sub_token,
         expire_at=expire_at,
         is_active=True
     )
     db.add(new_config)
 
-    # Шаг 9
+    # Шаг 8
     invoice = Invoice(
         client_id=current_user.id,
         plan_id=plan.id,
@@ -241,18 +188,13 @@ async def buy_subscription(
     )
     db.add(invoice)
 
-    # Шаг 10 — списываем деньги, обновляем счётчики
+    # Шаг 9
     current_user.balance -= final_price
     server.current_users_count += 1
 
-    # Обновляем список shortIds сервера в нашей БД
-    current_ids = json.loads(server.reality_short_ids or "[]")
-    current_ids.append(short_id)
-    server.reality_short_ids = json.dumps(current_ids)
-
     await db.commit()
 
-    # Шаг 11
+    # Шаг 10
     return {
         "status": "Подписка активирована!",
         "sub_url": f"/sub/{sub_token}",

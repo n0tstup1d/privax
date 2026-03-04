@@ -150,10 +150,36 @@ async def create_marzban_user(
                         return {"success": False, "error": f"Marzban вернул {response.status_code}: {response.text}"}
 
                     data = response.json()
+                    user_uuid = data.get("proxies", {}).get("vless", {}).get("id")
+                    subscription_url = data.get("subscription_url")
+
+                    # POST /api/user возвращает links пустым — sid ещё не заполнен.
+                    # Делаем отдельный GET чтобы получить полностью сформированную ссылку.
+                    get_response = await client.get(
+                        f"http://127.0.0.1:{local_port}/api/user/{marzban_username}",
+                        headers=headers
+                    )
+                    if get_response.status_code == 200:
+                        get_data = get_response.json()
+                        links = get_data.get("links", [])
+                    else:
+                        links = data.get("links", [])  # fallback на данные из POST
+
+                    vless_link = next(
+                        (l for l in links if l.startswith("vless://")),
+                        None
+                    )
+
+                    # Заменяем label (часть после #) на "Privax"
+                    # Marzban ставит своё: "🚀 Marz (username) [VLESS - tcp]"
+                    if vless_link and "#" in vless_link:
+                        vless_link = vless_link[:vless_link.index("#")] + "#Privax"
+
                     return {
                         "success": True,
-                        "user_uuid": data.get("proxies", {}).get("vless", {}).get("id"),  # UUID из Marzban
-                        "subscription_url": data.get("subscription_url")
+                        "user_uuid": user_uuid,
+                        "subscription_url": subscription_url,
+                        "vless_link": vless_link,
                     }
 
     except asyncssh.DisconnectError:

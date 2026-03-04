@@ -173,6 +173,60 @@ async def configure_server(
 
                     config = config_response.json()
 
+                    # --- DNS LEAK FIX ---
+                    # Проблема: клиент из Ирана делает DNS запрос → Google резолвит его
+                    # через ближайший узел (Иран) → whoer видит иранский DNS.
+                    #
+                    # Решение: DNS запросы маршрутизируем через сам VPN туннель.
+                    # Тогда DNS уходит с немецкого IP сервера — утечки нет.
+                    #
+                    # Как это работает:
+                    # 1. В routing добавляем правило: порт 53 → outbound "dns-out"
+                    # 2. "dns-out" это специальный outbound типа "dns" — он перехватывает
+                    #    DNS запросы и резолвит их через сервер (с немецкого IP)
+                    # 3. DNS серверы оставляем те же (8.8.8.8 и т.д.) но запросы к ним
+                    #    теперь идут через туннель, а не напрямую с клиента
+
+                    # Патчим DNS секцию — оставляем серверы, добавляем tag
+                    if "dns" not in config:
+                        config["dns"] = {}
+                    config["dns"]["servers"] = [
+                        "tcp+local://8.8.8.8",
+                        "tcp+local://8.8.4.4",
+                        "tcp+local://1.1.1.1",
+                        "tcp+local://1.0.0.1"
+                    ]
+                    config["dns"]["disableCache"] = False
+                    config["dns"]["queryStrategy"] = "UseIPv4"
+
+                    # Добавляем dns-out outbound если его ещё нет
+                    outbounds = config.get("outbounds", [])
+                    has_dns_out = any(o.get("tag") == "dns-out" for o in outbounds)
+                    if not has_dns_out:
+                        outbounds.append({
+                            "protocol": "dns",
+                            "tag": "dns-out"
+                        })
+                        config["outbounds"] = outbounds
+
+                    # Добавляем правило роутинга: UDP/TCP порт 53 → dns-out
+                    routing = config.get("routing", {})
+                    rules = routing.get("rules", [])
+                    has_dns_rule = any(
+                        o.get("outboundTag") == "dns-out" for o in rules
+                    )
+                    if not has_dns_rule:
+                        # Вставляем в начало — чтобы DNS правило имело приоритет
+                        rules.insert(0, {
+                            "type": "field",
+                            "network": "tcp,udp",
+                            "port": 53,
+                            "outboundTag": "dns-out"
+                        })
+                    routing["rules"] = rules
+                    config["routing"] = routing
+                    # --- КОНЕЦ DNS LEAK FIX ---
+
                     # shortIds: один на каждого клиента, минимум MIN_SHORT_IDS
                     new_short_ids = _generate_short_ids(current_users_count)
 
@@ -197,6 +251,10 @@ async def configure_server(
                         reality["serverNames"] = domains_to_use
                         reality["shortIds"] = new_short_ids
                         reality["dest"] = f"{best_dest}:443"
+                        # SpiderX — базовый путь паука Reality на сервере.
+                        # Когда это поле задано, Marzban автоматически включает
+                        # spx= в генерируемые ссылки клиентов — нам ничего не нужно делать самим.
+                        reality["SpiderX"] = "/"
                         # Каждый инбаунд — свой fingerprint из пула (ротация по индексу)
                         reality["fingerprint"] = FINGERPRINTS[i % len(FINGERPRINTS)]
 
