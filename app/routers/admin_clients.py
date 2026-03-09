@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
@@ -21,16 +22,11 @@ router = APIRouter()
 
 @router.get("/clients")
 async def get_all_clients(db: AsyncSession = Depends(get_db), _=Depends(get_current_admin)):
-    """
-    Список всех клиентов с краткой сводкой.
-    Для быстрого обзора — кто есть, сколько у каждого активных подписок.
-    """
     result = await db.execute(select(Client).order_by(Client.id))
     clients = result.scalars().all()
 
     response = []
     for c in clients:
-        # Считаем активные подписки для каждого клиента
         configs_result = await db.execute(
             select(func.count(Config.id)).where(
                 Config.client_id == c.id,
@@ -39,12 +35,12 @@ async def get_all_clients(db: AsyncSession = Depends(get_db), _=Depends(get_curr
             )
         )
         active_count = configs_result.scalar()
-
         response.append({
             "id": c.id,
             "email": c.email,
             "balance": c.balance,
             "is_admin": c.is_admin,
+            "is_banned": c.is_banned,
             "active_subscriptions": active_count,
         })
 
@@ -57,21 +53,11 @@ async def get_client_profile(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Полный профиль клиента — всё что нужно знать администратору.
-    
-    Возвращает:
-    - Основные данные клиента
-    - Все подписки (активные и истёкшие) с деталями серверов
-    - Полную историю платежей
-    """
-    # Клиент
     result = await db.execute(select(Client).where(Client.id == client_id))
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Клиент не найден")
 
-    # Все конфиги клиента
     configs_result = await db.execute(
         select(Config).where(Config.client_id == client_id).order_by(Config.expire_at.desc())
     )
@@ -79,10 +65,8 @@ async def get_client_profile(
 
     configs_data = []
     for c in configs:
-        # Подтягиваем сервер и план для каждого конфига
         server = await db.get(VPNServer, c.server_id)
         plan = await db.get(ServicePlan, c.plan_id)
-
         now = datetime.utcnow()
         configs_data.append({
             "id": c.id,
@@ -106,7 +90,6 @@ async def get_client_profile(
             }
         })
 
-    # История платежей
     invoices_result = await db.execute(
         select(Invoice).where(Invoice.client_id == client_id).order_by(Invoice.created_at.desc())
     )
@@ -116,7 +99,6 @@ async def get_client_profile(
     for inv in invoices:
         plan = await db.get(ServicePlan, inv.plan_id) if inv.plan_id else None
         admin = await db.get(Client, inv.topped_up_by) if inv.topped_up_by else None
-
         invoices_data.append({
             "id": inv.id,
             "amount": inv.amount,
@@ -132,14 +114,15 @@ async def get_client_profile(
         "email": client.email,
         "balance": client.balance,
         "is_admin": client.is_admin,
+        "is_banned": client.is_banned,
         "subscriptions": configs_data,
         "payment_history": invoices_data,
     }
 
 
-# --- Схемы для изменения клиента ---
 class ClientUpdate(BaseModel):
     is_admin: Optional[bool] = None
+    is_banned: Optional[bool] = None
     balance: Optional[float] = None
 
 
@@ -150,10 +133,6 @@ async def update_client(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Изменить данные клиента вручную.
-    Можно дать/забрать права админа, скорректировать баланс.
-    """
     result = await db.execute(select(Client).where(Client.id == client_id))
     client = result.scalar_one_or_none()
     if not client:
@@ -161,6 +140,8 @@ async def update_client(
 
     if body.is_admin is not None:
         client.is_admin = body.is_admin
+    if body.is_banned is not None:
+        client.is_banned = body.is_banned
     if body.balance is not None:
         client.balance = round(body.balance, 2)
 
@@ -170,6 +151,7 @@ async def update_client(
         "id": client.id,
         "email": client.email,
         "is_admin": client.is_admin,
+        "is_banned": client.is_banned,
         "balance": client.balance,
     }
 
@@ -180,17 +162,11 @@ async def delete_client(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Удаляет клиента.
-    Перед удалением — отключает все его подписки в Marzban.
-    Если Marzban не ответил — всё равно удаляем из нашей БД.
-    """
     result = await db.execute(select(Client).where(Client.id == client_id))
     client = result.scalar_one_or_none()
     if not client:
         raise HTTPException(status_code=404, detail="Клиент не найден")
 
-    # Удаляем все его конфиги в Marzban
     configs_result = await db.execute(
         select(Config).where(Config.client_id == client_id, Config.is_active == True)
     )
@@ -210,7 +186,7 @@ async def delete_client(
             if server.current_users_count > 0:
                 server.current_users_count -= 1
 
-    await db.delete(client)  # cascade удалит токены, конфиги, инвойсы
+    await db.delete(client)
     await db.commit()
     return {"status": "Клиент удалён"}
 
@@ -225,12 +201,6 @@ async def toggle_config(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Включить или выключить подписку клиента.
-    
-    Переключает состояние — если активна, выключит. Если выключена, включит.
-    Синхронизирует с Marzban через SSH туннель.
-    """
     result = await db.execute(select(Config).where(Config.id == config_id))
     config = result.scalar_one_or_none()
     if not config:
@@ -240,7 +210,6 @@ async def toggle_config(
     if not server:
         raise HTTPException(status_code=404, detail="Сервер подписки не найден")
 
-    # Переключаем состояние
     new_state = not config.is_active
 
     toggle_result = await toggle_marzban_user(
@@ -261,7 +230,6 @@ async def toggle_config(
 
     config.is_active = new_state
     await db.commit()
-
     return {
         "status": "включена" if new_state else "выключена",
         "config_id": config_id,
@@ -270,7 +238,7 @@ async def toggle_config(
 
 
 class ConfigExtend(BaseModel):
-    days: int   # на сколько дней продлить
+    days: int
 
 
 @router.patch("/configs/{config_id}/extend")
@@ -280,17 +248,11 @@ async def extend_config(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Продлить подписку вручную на указанное количество дней.
-    Полезно для решения спорных ситуаций, бонусов клиентам и т.д.
-    """
     result = await db.execute(select(Config).where(Config.id == config_id))
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Подписка не найдена")
 
-    # Если подписка уже истекла — продлеваем от сегодня
-    # Если ещё активна — добавляем дни к текущей дате истечения
     base = max(config.expire_at, datetime.utcnow())
     config.expire_at = base + timedelta(days=body.days)
 
@@ -308,10 +270,6 @@ async def delete_config(
     db: AsyncSession = Depends(get_db),
     _=Depends(get_current_admin)
 ):
-    """
-    Полностью удаляет подписку — из нашей БД и из Marzban.
-    Используй когда нужно убрать конфиг насовсем, не просто выключить.
-    """
     result = await db.execute(select(Config).where(Config.id == config_id))
     config = result.scalar_one_or_none()
     if not config:
@@ -341,23 +299,20 @@ async def delete_config(
 
 @router.get("/overview")
 async def get_overview(db: AsyncSession = Depends(get_db), _=Depends(get_current_admin)):
-    """
-    Общая сводка по всей инфраструктуре.
-    Один запрос — полная картина состояния сервиса.
-    """
-    # Статистика клиентов
     total_clients = await db.scalar(select(func.count(Client.id)))
     total_revenue = await db.scalar(
         select(func.sum(Invoice.amount)).where(Invoice.status == InvoiceStatus.PAID)
     )
 
-    # Серверы с детальной статистикой
-    servers_result = await db.execute(select(VPNServer).order_by(VPNServer.tier_level))
+    servers_result = await db.execute(
+        select(VPNServer)
+        .options(selectinload(VPNServer.tier))
+        .order_by(VPNServer.tier_level)
+    )
     servers = servers_result.scalars().all()
 
     servers_data = []
     for s in servers:
-        # Считаем активные конфиги на этом сервере
         active_configs = await db.scalar(
             select(func.count(Config.id)).where(
                 Config.server_id == s.id,
@@ -372,13 +327,13 @@ async def get_overview(db: AsyncSession = Depends(get_db), _=Depends(get_current
             "country": s.country_code,
             "tier": s.tier_level,
             "is_active": s.is_active,
-            "users_in_db": active_configs,          # считаем из наших конфигов
-            "users_counter": s.current_users_count,  # счётчик который обновляем при покупке
+            "users_in_db": active_configs,
+            "users_counter": s.current_users_count,
+            "max_users": s.tier.default_max_users if s.tier else 0,
             "marzban_port": s.marzban_port,
             "ssh_port": s.ssh_port,
         })
 
-    # Активные подписки по тарифам
     plans_result = await db.execute(select(ServicePlan).order_by(ServicePlan.tier_level))
     plans = plans_result.scalars().all()
 
@@ -409,6 +364,7 @@ async def get_overview(db: AsyncSession = Depends(get_db), _=Depends(get_current
         "plans": plans_data,
     }
 
+
 # ═══════════════════════════════════════════════
 #  ПЕРЕНОС КЛИЕНТА НА ДРУГОЙ СЕРВЕР
 # ═══════════════════════════════════════════════
@@ -423,30 +379,18 @@ async def migrate_config(
     body: MigrateConfigRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Переносит подписку клиента на другой сервер.
-
-    Используй когда:
-    - Текущий сервер заблокирован или перегружен
-    - Нужно балансировать нагрузку вручную
-    - Клиент жалуется на скорость
-
-    Что происходит:
-    1. Удаляем юзера со старого сервера в Marzban
-    2. Создаём юзера на новом сервере в Marzban
-    3. Обновляем Config в БД — новый сервер, новая ссылка, новый sub_token
-    4. Счётчики серверов обновляются
-    
-    Срок подписки сохраняется — клиент не теряет оплаченное время.
-    """
-    # Получаем конфиг
     result = await db.execute(select(Config).where(Config.id == config_id))
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Подписка не найдена")
 
-    # Получаем целевой сервер
-    target_server = await db.get(VPNServer, body.target_server_id)
+    # Загружаем целевой сервер вместе с тиром
+    target_result = await db.execute(
+        select(VPNServer)
+        .options(selectinload(VPNServer.tier))
+        .where(VPNServer.id == body.target_server_id)
+    )
+    target_server = target_result.scalar_one_or_none()
     if not target_server:
         raise HTTPException(status_code=404, detail="Целевой сервер не найден")
 
@@ -456,7 +400,8 @@ async def migrate_config(
     if target_server.id == config.server_id:
         raise HTTPException(status_code=400, detail="Клиент уже на этом сервере")
 
-    if target_server.current_users_count >= target_server.max_users:
+    max_users = target_server.tier.default_max_users if target_server.tier else 0
+    if target_server.current_users_count >= max_users:
         raise HTTPException(status_code=400, detail="Целевой сервер заполнен")
 
     old_server = await db.get(VPNServer, config.server_id)
@@ -475,7 +420,6 @@ async def migrate_config(
             old_server.current_users_count -= 1
 
     # Шаг 2 — создаём на новом сервере
-    # Считаем сколько дней осталось до конца подписки
     days_left = max(1, (config.expire_at - datetime.utcnow()).days)
 
     marzban_result = await create_marzban_user(
@@ -494,16 +438,16 @@ async def migrate_config(
             detail=f"Не удалось создать юзера на новом сервере: {marzban_result['error']}"
         )
 
-    # Шаг 3 — обновляем Config в БД
+    # Шаг 3 — обновляем Config
     config.server_id  = target_server.id
     config.vless_link = marzban_result.get("vless_link")
-    config.sub_token  = generate_sub_token()  # новый токен — старая ссылка становится невалидной
+    config.sub_token  = generate_sub_token()
 
-    # Шаг 4 — обновляем счётчик нового сервера
+    # Шаг 4 — счётчик нового сервера
     target_server.current_users_count += 1
 
     await db.commit()
-
+ 
     return {
         "status": "Клиент перенесён",
         "config_id": config_id,
@@ -511,4 +455,4 @@ async def migrate_config(
         "new_server": target_server.name,
         "new_sub_url": f"/sub/{config.sub_token}",
         "days_remaining": days_left,
-    }
+    } 

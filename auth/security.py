@@ -26,7 +26,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def create_tokens(data: dict):
     # Твоя функция создания токенов остается без изменений
-    access_expire = datetime.utcnow() + timedelta(days=300)
+    access_expire = datetime.utcnow() + timedelta(minutes=5)
     access_token = jwt.encode({**data, "exp": access_expire}, SECRET_KEY, algorithm=ALGORITHM)
     
     refresh_expire = datetime.utcnow() + timedelta(days=150)

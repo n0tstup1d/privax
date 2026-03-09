@@ -73,7 +73,8 @@ async def create_marzban_user(
     mar_admin_pass: str,    # уже расшифрованный
     marzban_username: str,  # имя которое мы придумали для клиента, например "privax_42"
     expire_days: int,       # на сколько дней создаём (plan.months * 30)
-    data_limit_gb: int = 0  # лимит трафика в ГБ (0 = безлимит)
+    data_limit_gb: int = 0,
+    device_limit: int | None = None
 ) -> dict:
     """
     Создаёт пользователя в Marzban.
@@ -140,6 +141,8 @@ async def create_marzban_user(
                         "data_limit_reset_strategy": "no_reset",
                         "status": "active"
                     }
+                    if device_limit is not None and device_limit > 0:
+                        payload["note"] = f"device_limit={device_limit}"
 
                     response = await client.post(
                         f"http://127.0.0.1:{local_port}/api/user",
@@ -300,3 +303,4 @@ async def toggle_marzban_user(
         return {"success": False, "error": "SSH: ключ не подошёл"}
     except Exception as e:
         return {"success": False, "error": f"Неожиданная ошибка: {str(e)}"}
+

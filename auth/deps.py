@@ -30,7 +30,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-        
+
+    # Забаненные пользователи не могут пользоваться системой,
+    # НО администраторы имеют доступ даже с баном
+    if user.is_banned and not user.is_admin:
+        raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+
     return user
 
 

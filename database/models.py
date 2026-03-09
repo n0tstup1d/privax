@@ -1,7 +1,7 @@
 from enum import Enum as PyEnum
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import ForeignKey, String, Float, Text, Enum
+from sqlalchemy import ForeignKey, String, Float, Text, Enum, Integer
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -9,32 +9,59 @@ class Base(DeclarativeBase):
     pass
 
 
+# --- ТИРЫ СЕРВЕРОВ ---
+
+class ServerTier(Base):
+    """
+    Уровень (тир) серверов. Все свойства уровня хранятся здесь —
+    серверы и планы просто ссылаются на тир по FK.
+
+    level            — уникальный номер (1, 2, 3...), используется как FK
+    default_max_users — сколько юзеров помещается на один сервер этого тира
+    max_sessions     — максимум одновременных устройств у клиента этого тира
+    speed_mbps       — декларируемая скорость для клиентов (0 = не показываем)
+    priority         — приоритет обслуживания (чем выше — тем лучше)
+    """
+    __tablename__ = "server_tiers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    level: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True)        # "silver"
+    display_name: Mapped[str] = mapped_column(String(100))            # "Silver"
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    default_max_users: Mapped[int] = mapped_column(default=100)
+    max_sessions: Mapped[int] = mapped_column(default=3)
+    speed_mbps: Mapped[int] = mapped_column(default=0)
+    priority: Mapped[int] = mapped_column(default=1)
+
+    servers: Mapped[List["VPNServer"]] = relationship(back_populates="tier", foreign_keys="VPNServer.tier_level")
+    plans:   Mapped[List["ServicePlan"]] = relationship(back_populates="tier", foreign_keys="ServicePlan.tier_level")
+
+
 # --- БИЛЛИНГ И ТАРИФЫ ---
 
 class ServicePlan(Base):
     """
     Тарифные планы. Один план = один период одного уровня.
-    Например: Silver 1м, Silver 3м, Silver 6м — это три разных записи с tier_level=1.
+    Например: Silver 1м, Silver 3м, Silver 6м — три записи с tier_level=1.
 
-    price            — базовая цена ЗА МЕСЯЦ в рублях
-    months           — на сколько месяцев этот план (1, 3, 6...)
-    discount_percent — скидка в % которая применяется к итоговой сумме
-    data_limit_gb    — лимит трафика в ГБ за весь период (0 = безлимит)
-
-    Итоговая сумма считается так:
-        base  = price * months
-        final = base * (1 - discount_percent / 100)
+    max_sessions и default_max_users берутся из ServerTier — здесь не хранятся.
+    Итоговая цена: price * months * (1 - discount_percent / 100)
     """
     __tablename__ = "service_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(50))           # "Silver 3 месяца" и т.д.
-    tier_level: Mapped[int] = mapped_column(default=1)      # уровень серверов (1=Silver, 2=Gold...)
-    price: Mapped[float] = mapped_column(Float)             # базовая цена за 1 месяц
-    months: Mapped[int] = mapped_column(default=1)          # период подписки в месяцах
-    discount_percent: Mapped[float] = mapped_column(Float, default=0.0)  # скидка в %
-    max_sessions: Mapped[int] = mapped_column(default=3)    # лимит одновременных устройств
-    data_limit_gb: Mapped[int] = mapped_column(default=0)   # лимит трафика в ГБ (0 = безлимит)
+    name: Mapped[str] = mapped_column(String(50))
+    display_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tier_level: Mapped[int] = mapped_column(ForeignKey("server_tiers.level"))
+    price: Mapped[float] = mapped_column(Float)
+    months: Mapped[int] = mapped_column(default=1)
+    discount_percent: Mapped[float] = mapped_column(Float, default=0.0)
+    data_limit_gb: Mapped[int] = mapped_column(default=0)
+
+    tier: Mapped["ServerTier"] = relationship(back_populates="plans", foreign_keys=[tier_level])
 
 
 class InvoiceStatus(PyEnum):
@@ -44,14 +71,6 @@ class InvoiceStatus(PyEnum):
 
 
 class Invoice(Base):
-    """
-    Фиксирует любое движение денег.
-
-    plan_id = None      → пополнение баланса
-    plan_id = int       → покупка подписки
-    topped_up_by = None → система (покупка) или платёжка (ЮKassa)
-    topped_up_by = int  → id админа который пополнил вручную
-    """
     __tablename__ = "invoices"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -71,13 +90,13 @@ class Invoice(Base):
 # --- ПОЛЬЗОВАТЕЛИ ---
 
 class Client(Base):
-    """Главная таблица клиента"""
     __tablename__ = "clients"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(unique=True, nullable=False)
     password: Mapped[str] = mapped_column(nullable=False)
     is_admin: Mapped[bool] = mapped_column(default=False)
+    is_banned: Mapped[bool] = mapped_column(default=False)
     balance: Mapped[float] = mapped_column(default=0.0)
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True)
 
@@ -85,10 +104,10 @@ class Client(Base):
     configs: Mapped[List["Config"]] = relationship(back_populates="owner")
     invoices: Mapped[List["Invoice"]] = relationship(back_populates="client", foreign_keys="Invoice.client_id")
     notifications: Mapped[List["Notification"]] = relationship(back_populates="client")
+    tickets:       Mapped[List["SupportTicket"]]  = relationship(back_populates="client")
 
 
 class RefreshToken(Base):
-    """Сессии пользователей"""
     __tablename__ = "refresh_tokens"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -99,14 +118,6 @@ class RefreshToken(Base):
 
 
 class LoginAttempt(Base):
-    """
-    Журнал неудачных попыток входа для антибрутфорс защиты.
-
-    Логика:
-        - Считаем попытки за последние BRUTE_WINDOW минут
-        - Если >= MAX_ATTEMPTS — блокируем до blocked_until
-        - После blocked_until счётчик сбрасывается автоматически
-    """
     __tablename__ = "login_attempts"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -117,12 +128,6 @@ class LoginAttempt(Base):
 
 
 class PasswordResetCode(Base):
-    """
-    Одноразовый 6-значный код для сброса пароля.
-    Действует RESET_TTL минут, после использования удаляется.
-    Сейчас код печатается в консоль — когда подключишь email,
-    просто замени print() на вызов email_service.
-    """
     __tablename__ = "password_reset_codes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -137,41 +142,34 @@ class PasswordResetCode(Base):
 # --- VPN ИНФРАСТРУКТУРА ---
 
 class VPNServer(Base):
-    """Наши сервера Marzban"""
+    """
+    Сервер Marzban. Вместимость берётся из ServerTier.default_max_users.
+    """
     __tablename__ = "vpn_servers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(50))
     country_code: Mapped[str] = mapped_column(String(5), default="DE")
-    tier_level: Mapped[int] = mapped_column(default=1)
+    tier_level: Mapped[int] = mapped_column(ForeignKey("server_tiers.level"))
     ip_address: Mapped[str] = mapped_column(unique=True)
     ssh_port: Mapped[int] = mapped_column(default=22)
 
     marzban_port: Mapped[int] = mapped_column(default=8000)
-    mar_admin_user: Mapped[str] = mapped_column()           # зашифровано через crypto_service
-    mar_admin_pass: Mapped[str] = mapped_column()           # зашифровано через crypto_service
+    mar_admin_user: Mapped[str] = mapped_column()
+    mar_admin_pass: Mapped[str] = mapped_column()
 
-    current_users_count: Mapped[int] = mapped_column(default=0)   # текущее кол-во активных юзеров
-    max_users: Mapped[int] = mapped_column(default=100)            # лимит — сколько юзеров можно посадить
+    current_users_count: Mapped[int] = mapped_column(default=0)
     is_active: Mapped[bool] = mapped_column(default=True)
 
-    # Reality параметры — заполняются автоматически при добавлении сервера
     reality_public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    reality_short_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # JSON: ["id1", "id2"]
-    server_names: Mapped[Optional[str]] = mapped_column(Text, nullable=True)         # JSON: ["domain1", "domain2"]
+    reality_short_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    server_names: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    tier:    Mapped["ServerTier"] = relationship(back_populates="servers", foreign_keys=[tier_level])
     configs: Mapped[List["Config"]] = relationship(back_populates="server")
 
 
 class Config(Base):
-    """
-    Активная подписка клиента.
-    Одна запись = один активный VPN-аккаунт на одном сервере.
-
-    marzban_username — имя юзера в Marzban (нужно для удаления/отключения)
-    vless_link       — готовая ссылка от Marzban, пишется в БД как статичный снапшот
-    sub_token        — токен для /sub/{token}, через который клиент получает актуальную ссылку
-    """
     __tablename__ = "configs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -180,16 +178,16 @@ class Config(Base):
     plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
 
     marzban_username: Mapped[str] = mapped_column(String(100), unique=True)
-    vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # ссылка от Marzban
-    sub_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)  # токен для /sub/{token}
+    vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sub_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
 
     expire_at: Mapped[datetime] = mapped_column()
     auto_renew: Mapped[bool] = mapped_column(default=False)
     is_active: Mapped[bool] = mapped_column(default=True)
 
-    owner: Mapped["Client"] = relationship(back_populates="configs")
-    server: Mapped["VPNServer"] = relationship(back_populates="configs")
-    plan: Mapped["ServicePlan"] = relationship()
+    owner:  Mapped["Client"]      = relationship(back_populates="configs")
+    server: Mapped["VPNServer"]   = relationship(back_populates="configs")
+    plan:   Mapped["ServicePlan"] = relationship()
 
 
 # --- ДОМЕНЫ-МАСКИ ---
@@ -199,63 +197,38 @@ class TrustedDomain(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     domain: Mapped[str] = mapped_column(String(255), unique=True)
-    country_code: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)  # NULL = глобальный
+    country_code: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True)
     added_by: Mapped[Optional[int]] = mapped_column(ForeignKey("clients.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
+
 # --- МАРКЕТИНГ И УВЕДОМЛЕНИЯ ---
 
 class PromocodeType(PyEnum):
-    BALANCE  = "balance"   # зачисляет рубли на баланс
-    DISCOUNT = "discount"  # скидка % при покупке подписки
+    BALANCE  = "balance"
+    DISCOUNT = "discount"
 
- 
+
 class Promocode(Base):
-    """
-    Промокод.
-
-    Типы:
-        balance  — зачисляет value рублей на баланс клиента
-        discount — даёт скидку discount_percent% при покупке подписки
-
-    plan_id = None  → скидка действует на любой тариф
-    plan_id = int   → скидка только на конкретный тариф
-
-    max_usages_per_client — сколько раз один клиент может использовать
-                            (1 = одноразовый для каждого, 0 = без ограничений)
-    """
     __tablename__ = "promocodes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(unique=True)
-    promo_type: Mapped[PromocodeType] = mapped_column(
-        Enum(PromocodeType), default=PromocodeType.BALANCE
-    )
-
-    # Для type=balance: сколько рублей начислить
+    promo_type: Mapped[PromocodeType] = mapped_column(Enum(PromocodeType), default=PromocodeType.BALANCE)
     value: Mapped[float] = mapped_column(default=0.0)
-
-    # Для type=discount: процент скидки и на какой план (None = все)
     discount_percent: Mapped[float] = mapped_column(Float, default=0.0)
-    plan_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("service_plans.id"), nullable=True
-    )
-
-    max_usages: Mapped[int] = mapped_column(default=1)          # всего активаций (0 = ∞)
-    max_usages_per_client: Mapped[int] = mapped_column(default=1)  # на одного клиента (0 = ∞)
+    plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("service_plans.id"), nullable=True)
+    max_usages: Mapped[int] = mapped_column(default=1)
+    max_usages_per_client: Mapped[int] = mapped_column(default=1)
     current_usages: Mapped[int] = mapped_column(default=0)
     expires_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
-    plan: Mapped[Optional["ServicePlan"]] = relationship()
-    usages: Mapped[List["PromocodeUsage"]] = relationship(back_populates="promocode", cascade="all, delete-orphan")
+    plan:   Mapped[Optional["ServicePlan"]] = relationship()
+    usages: Mapped[List["PromocodeUsage"]]  = relationship(back_populates="promocode", cascade="all, delete-orphan")
 
 
 class PromocodeUsage(Base):
-    """
-    Журнал использования промокодов.
-    Нужен чтобы контролировать лимит на одного клиента.
-    """
     __tablename__ = "promocode_usages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -264,11 +237,10 @@ class PromocodeUsage(Base):
     used_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
     promocode: Mapped["Promocode"] = relationship(back_populates="usages")
-    client: Mapped["Client"] = relationship()
+    client:    Mapped["Client"]    = relationship()
 
 
 class Notification(Base):
-    """Входящие сообщения в личном кабинете"""
     __tablename__ = "notifications"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -279,3 +251,83 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
     client: Mapped["Client"] = relationship(back_populates="notifications")
+
+class FaqArticle(Base):
+    """
+    Статья FAQ. Контент хранится как Markdown в поле `content`.
+    Картинки привязаны к статье через FaqImage.
+    """
+    __tablename__ = "faq_articles"
+
+    id:           Mapped[int]      = mapped_column(primary_key=True)
+    title:        Mapped[str]      = mapped_column(String(200))
+    slug:         Mapped[str]      = mapped_column(String(200), unique=True, index=True)
+    category:     Mapped[str]      = mapped_column(String(100), default="Общее")
+    content:      Mapped[str]      = mapped_column(Text)
+    is_published: Mapped[bool]     = mapped_column(default=False)
+    created_at:   Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at:   Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    images: Mapped[List["FaqImage"]] = relationship(back_populates="article", cascade="all, delete-orphan")
+
+
+class FaqImage(Base):
+    """Картинка привязанная к статье FAQ, хранится на диске."""
+    __tablename__ = "faq_images"
+
+    id:          Mapped[int] = mapped_column(primary_key=True)
+    article_id:  Mapped[int] = mapped_column(ForeignKey("faq_articles.id"))
+    filename:    Mapped[str] = mapped_column(String(200))
+    stored_name: Mapped[str] = mapped_column(String(200))
+    mime_type:   Mapped[str] = mapped_column(String(50), default="image/png")
+
+    article: Mapped["FaqArticle"] = relationship(back_populates="images")
+
+
+class SupportTicket(Base):
+    """Обращение пользователя: вопрос, жалоба, предложение."""
+    __tablename__ = "support_tickets"
+
+    id:         Mapped[int]      = mapped_column(primary_key=True)
+    client_id:  Mapped[int]      = mapped_column(ForeignKey("clients.id"))
+    type:       Mapped[str]      = mapped_column(String(20))   # question / complaint / suggestion
+    subject:    Mapped[str]      = mapped_column(String(200))
+    message:    Mapped[str]      = mapped_column(Text)
+    status:     Mapped[str]      = mapped_column(String(20), default="open")  # open / answered / closed
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    client:  Mapped["Client"]          = relationship(back_populates="tickets")
+    replies: Mapped[List["TicketReply"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", order_by="TicketReply.created_at")
+    attachments: Mapped[List["TicketAttachment"]] = relationship(back_populates="ticket", cascade="all, delete-orphan", foreign_keys="TicketAttachment.ticket_id")
+
+
+class TicketReply(Base):
+    """Ответ на обращение (от пользователя или от администратора)."""
+    __tablename__ = "ticket_replies"
+
+    id:         Mapped[int]      = mapped_column(primary_key=True)
+    ticket_id:  Mapped[int]      = mapped_column(ForeignKey("support_tickets.id"))
+    is_admin:   Mapped[bool]     = mapped_column(default=False)
+    message:    Mapped[str]      = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+    ticket: Mapped["SupportTicket"] = relationship(back_populates="replies")
+    attachments: Mapped[List["TicketAttachment"]] = relationship(back_populates="reply", cascade="all, delete-orphan", foreign_keys="TicketAttachment.reply_id")
+
+
+class TicketAttachment(Base):
+    """Файл/фото, прикреплённый к тикету или к ответу."""
+    __tablename__ = "ticket_attachments"
+
+    id:         Mapped[int]           = mapped_column(primary_key=True)
+    ticket_id:  Mapped[int]           = mapped_column(ForeignKey("support_tickets.id"), nullable=True)
+    reply_id:   Mapped[Optional[int]] = mapped_column(ForeignKey("ticket_replies.id"), nullable=True)
+    filename:   Mapped[str]           = mapped_column(String(255))
+    stored_name:Mapped[str]           = mapped_column(String(255))   # UUID-имя на диске
+    mime_type:  Mapped[str]           = mapped_column(String(100))
+    size:       Mapped[int]           = mapped_column(Integer)        # bytes
+    created_at: Mapped[datetime]      = mapped_column(default=datetime.utcnow)
+
+    ticket: Mapped[Optional["SupportTicket"]] = relationship(back_populates="attachments", foreign_keys=[ticket_id])
+    reply:  Mapped[Optional["TicketReply"]]   = relationship(back_populates="attachments", foreign_keys=[reply_id])

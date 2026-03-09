@@ -1,7 +1,9 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+import os
 from database.models import Base
 from database.database import engine
-from app.routers import auth, users, subscriptions, billing
+from app.routers import auth, users, subscriptions, billing, faq, support, faq
 from app.routers.admin import server, plans, domains, notifications
 from app.scheduler import start_scheduler
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +14,10 @@ import os
 from dotenv import load_dotenv
 
 app = FastAPI(title="Privax API")
+
+os.makedirs("uploads/support", exist_ok=True)
+os.makedirs("uploads/faq", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 load_dotenv()
 app.add_middleware(
@@ -43,6 +49,8 @@ app.include_router(admin_clients.router, prefix="/admin", tags=["Admin"])
 app.include_router(subscription_serve.router, tags=["Subscriptions"])
 app.include_router(promocodes.router, prefix="/promocodes", tags=["Promocodes"])
 app.include_router(notifications.router, prefix="/admin", tags=["Notifications(adm)"])
+app.include_router(faq.router, tags=["FAQ"])
+app.include_router(support.router, tags=["Support"])
 
 @app.get("/")
 async def root():
