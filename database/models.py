@@ -9,6 +9,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# --- ТИПЫ ИНБАУНДОВ ---
+
+class InboundType(str, PyEnum):
+    TCP_REALITY = "tcp_reality"  # VLESS + TCP + Reality
+
+
 # --- ТИРЫ СЕРВЕРОВ ---
 
 class ServerTier(Base):
@@ -47,7 +53,7 @@ class ServicePlan(Base):
     Например: Silver 1м, Silver 3м, Silver 6м — три записи с tier_level=1.
 
     max_sessions и default_max_users берутся из ServerTier — здесь не хранятся.
-    Итоговая цена: price * months * (1 - discount_percent / 100)
+    Итоговая цена: price * (duration_days / 30) * (1 - discount_percent / 100)
     """
     __tablename__ = "service_plans"
 
@@ -57,9 +63,10 @@ class ServicePlan(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tier_level: Mapped[int] = mapped_column(ForeignKey("server_tiers.level"))
     price: Mapped[float] = mapped_column(Float)
-    months: Mapped[int] = mapped_column(default=1)
+    duration_days: Mapped[int] = mapped_column(default=30)  # длительность в днях (3, 7, 30, 90, 180...)
     discount_percent: Mapped[float] = mapped_column(Float, default=0.0)
-    data_limit_gb: Mapped[int] = mapped_column(default=0)
+    is_hidden: Mapped[bool] = mapped_column(default=False)  # скрыть от клиентов (не удалять)
+    purchase_limit: Mapped[int] = mapped_column(default=0)  # 0 = безлимит, 1 = только один раз
 
     tier: Mapped["ServerTier"] = relationship(back_populates="plans", foreign_keys=[tier_level])
 
@@ -99,12 +106,35 @@ class Client(Base):
     is_banned: Mapped[bool] = mapped_column(default=False)
     balance: Mapped[float] = mapped_column(default=0.0)
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True)
+    # ID реферера — кто пригласил этого пользователя
+    referred_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("clients.id"), nullable=True)
 
     refresh_tokens: Mapped[List["RefreshToken"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     configs: Mapped[List["Config"]] = relationship(back_populates="owner")
     invoices: Mapped[List["Invoice"]] = relationship(back_populates="client", foreign_keys="Invoice.client_id")
     notifications: Mapped[List["Notification"]] = relationship(back_populates="client")
     tickets:       Mapped[List["SupportTicket"]]  = relationship(back_populates="client")
+    referrals:     Mapped[List["Referral"]]        = relationship(back_populates="referrer", foreign_keys="Referral.referrer_id")
+
+
+class Referral(Base):
+    """
+    Запись о реферальном приглашении.
+    referrer_id  — кто пригласил (владелец ссылки)
+    referred_id  — кто пришёл по ссылке
+    bonus_given  — был ли уже начислен бонус рефереру
+    """
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    referrer_id: Mapped[int] = mapped_column(ForeignKey("clients.id"))
+    referred_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), unique=True)  # один юзер — один реферер
+    bonus_given: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    bonus_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
+    referrer: Mapped["Client"] = relationship(back_populates="referrals", foreign_keys=[referrer_id])
+    referred: Mapped["Client"] = relationship(foreign_keys=[referred_id])
 
 
 class RefreshToken(Base):
@@ -143,7 +173,7 @@ class PasswordResetCode(Base):
 
 class VPNServer(Base):
     """
-    Сервер Marzban. Вместимость берётся из ServerTier.default_max_users.
+    VPN-сервер на базе 3x-ui. Вместимость берётся из ServerTier.default_max_users.
     """
     __tablename__ = "vpn_servers"
 
@@ -154,12 +184,19 @@ class VPNServer(Base):
     ip_address: Mapped[str] = mapped_column(unique=True)
     ssh_port: Mapped[int] = mapped_column(default=22)
 
-    marzban_port: Mapped[int] = mapped_column(default=8000)
+    # Порт 3x-ui панели (по умолчанию 2053, но у каждого сервера может быть свой)
+    panel_port: Mapped[int] = mapped_column(default=2053)
+    panel_path: Mapped[str] = mapped_column(String(100), default="")  # секретный путь панели (например /IowuXQyUA8bB)
     mar_admin_user: Mapped[str] = mapped_column()
     mar_admin_pass: Mapped[str] = mapped_column()
 
     current_users_count: Mapped[int] = mapped_column(default=0)
     is_active: Mapped[bool] = mapped_column(default=True)
+
+    inbound_type: Mapped[InboundType] = mapped_column(
+        Enum(InboundType, values_callable=lambda x: [e.value for e in x]),
+        default=InboundType.TCP_REALITY
+    )
 
     reality_public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     reality_short_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -177,13 +214,18 @@ class Config(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey("vpn_servers.id"))
     plan_id: Mapped[int] = mapped_column(ForeignKey("service_plans.id"))
 
-    marzban_username: Mapped[str] = mapped_column(String(100), unique=True)
+    xui_username: Mapped[str] = mapped_column(String(100), unique=True)   # email в 3x-ui (напр. "privax_42_abc1")
+    xui_uuid: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)   # UUID клиента в 3x-ui
+    xui_inbound_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # ID инбаунда в 3x-ui
+    xui_short_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # shortId в инбаунде Reality
+
     vless_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sub_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
 
     expire_at: Mapped[datetime] = mapped_column()
     auto_renew: Mapped[bool] = mapped_column(default=False)
     is_active: Mapped[bool] = mapped_column(default=True)
+    last_reset_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
     owner:  Mapped["Client"]      = relationship(back_populates="configs")
     server: Mapped["VPNServer"]   = relationship(back_populates="configs")

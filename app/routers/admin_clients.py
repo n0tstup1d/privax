@@ -1,3 +1,4 @@
+import math
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta
 from auth.deps import get_current_admin
 from database.database import get_db
 from database.models import Client, Config, VPNServer, ServicePlan, Invoice, InvoiceStatus
-from app.services.marzban_service import toggle_marzban_user, delete_marzban_user, create_marzban_user
+from app.services.xui_service import toggle_xui_client, delete_xui_client, create_xui_client
 from app.services.crypto_service import decrypt
 from app.services.link_generator import generate_sub_token
 
@@ -70,11 +71,12 @@ async def get_client_profile(
         now = datetime.utcnow()
         configs_data.append({
             "id": c.id,
-            "marzban_username": c.marzban_username,
+            "xui_username": c.xui_username,
+            "xui_uuid": c.xui_uuid,
             "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
             "status": "active" if c.is_active and c.expire_at > now else "expired" if c.expire_at < now else "disabled",
-            "expire_at": c.expire_at.isoformat(),
-            "days_left": max(0, (c.expire_at - now).days),
+            "expire_at": c.expire_at.isoformat() + "Z",
+            "days_left": max(0, math.ceil((c.expire_at - now).total_seconds() / 86400)),
             "auto_renew": c.auto_renew,
             "server": {
                 "id": server.id if server else None,
@@ -175,13 +177,14 @@ async def delete_client(
     for config in configs:
         server = await db.get(VPNServer, config.server_id)
         if server:
-            await delete_marzban_user(
+            await delete_xui_client(
                 ip=server.ip_address,
                 ssh_port=server.ssh_port,
-                marzban_port=server.marzban_port,
+                panel_port=server.panel_port,
                 mar_admin_user=decrypt(server.mar_admin_user),
                 mar_admin_pass=decrypt(server.mar_admin_pass),
-                marzban_username=config.marzban_username
+                xui_uuid=config.xui_uuid,
+        xui_inbound_id=config.xui_inbound_id
             )
             if server.current_users_count > 0:
                 server.current_users_count -= 1
@@ -212,20 +215,21 @@ async def toggle_config(
 
     new_state = not config.is_active
 
-    toggle_result = await toggle_marzban_user(
+    toggle_result = await toggle_xui_client(
         ip=server.ip_address,
         ssh_port=server.ssh_port,
-        marzban_port=server.marzban_port,
+        panel_port=server.panel_port,
         mar_admin_user=decrypt(server.mar_admin_user),
         mar_admin_pass=decrypt(server.mar_admin_pass),
-        marzban_username=config.marzban_username,
+        xui_uuid=config.xui_uuid,
+        xui_inbound_id=config.xui_inbound_id,
         active=new_state
     )
 
     if not toggle_result["success"]:
         raise HTTPException(
             status_code=500,
-            detail=f"Marzban не ответил: {toggle_result['error']}. Статус в БД не изменён."
+            detail=f"3x-ui не ответил: {toggle_result['error']}. Статус в БД не изменён."
         )
 
     config.is_active = new_state
@@ -233,7 +237,8 @@ async def toggle_config(
     return {
         "status": "включена" if new_state else "выключена",
         "config_id": config_id,
-        "marzban_username": config.marzban_username,
+        "xui_username": config.xui_username,
+        "xui_uuid": config.xui_uuid,
     }
 
 
@@ -260,7 +265,7 @@ async def extend_config(
     return {
         "status": f"Подписка продлена на {body.days} дней",
         "config_id": config_id,
-        "new_expire_at": config.expire_at.isoformat(),
+        "new_expire_at": config.expire_at.isoformat() + "Z",
     }
 
 
@@ -277,13 +282,14 @@ async def delete_config(
 
     server = await db.get(VPNServer, config.server_id)
     if server:
-        await delete_marzban_user(
+        await delete_xui_client(
             ip=server.ip_address,
             ssh_port=server.ssh_port,
-            marzban_port=server.marzban_port,
+            panel_port=server.panel_port,
             mar_admin_user=decrypt(server.mar_admin_user),
             mar_admin_pass=decrypt(server.mar_admin_pass),
-            marzban_username=config.marzban_username
+            xui_uuid=config.xui_uuid,
+        xui_inbound_id=config.xui_inbound_id
         )
         if server.current_users_count > 0:
             server.current_users_count -= 1
@@ -330,7 +336,7 @@ async def get_overview(db: AsyncSession = Depends(get_db), _=Depends(get_current
             "users_in_db": active_configs,
             "users_counter": s.current_users_count,
             "max_users": s.tier.default_max_users if s.tier else 0,
-            "marzban_port": s.marzban_port,
+            "panel_port": s.panel_port,
             "ssh_port": s.ssh_port,
         })
 
@@ -408,40 +414,43 @@ async def migrate_config(
 
     # Шаг 1 — удаляем со старого сервера
     if old_server:
-        await delete_marzban_user(
+        await delete_xui_client(
             ip=old_server.ip_address,
             ssh_port=old_server.ssh_port,
-            marzban_port=old_server.marzban_port,
-            mar_admin_user=decrypt(old_server.mar_admin_user),
-            mar_admin_pass=decrypt(old_server.mar_admin_pass),
-            marzban_username=config.marzban_username
+            panel_port=old_server.panel_port,
+            xui_admin_user=decrypt(old_server.mar_admin_user),
+            xui_admin_pass=decrypt(old_server.mar_admin_pass),
+            xui_uuid=config.xui_uuid,
+            xui_inbound_id=config.xui_inbound_id,
         )
         if old_server.current_users_count > 0:
             old_server.current_users_count -= 1
 
     # Шаг 2 — создаём на новом сервере
-    days_left = max(1, (config.expire_at - datetime.utcnow()).days)
+    days_left = max(1, math.ceil((config.expire_at - datetime.utcnow()).total_seconds() / 86400))
 
-    marzban_result = await create_marzban_user(
+    xui_result = await create_xui_client(
         ip=target_server.ip_address,
         ssh_port=target_server.ssh_port,
-        marzban_port=target_server.marzban_port,
-        mar_admin_user=decrypt(target_server.mar_admin_user),
-        mar_admin_pass=decrypt(target_server.mar_admin_pass),
-        marzban_username=config.marzban_username,
-        expire_days=days_left
+        panel_port=target_server.panel_port,
+        xui_admin_user=decrypt(target_server.mar_admin_user),
+        xui_admin_pass=decrypt(target_server.mar_admin_pass),
+        username=config.xui_username,
+        expire_days=days_left,
     )
 
-    if not marzban_result["success"]:
+    if not xui_result["success"]:
         raise HTTPException(
             status_code=500,
-            detail=f"Не удалось создать юзера на новом сервере: {marzban_result['error']}"
+            detail=f"Не удалось создать юзера на новом сервере: {xui_result['error']}"
         )
 
     # Шаг 3 — обновляем Config
-    config.server_id  = target_server.id
-    config.vless_link = marzban_result.get("vless_link")
-    config.sub_token  = generate_sub_token()
+    config.server_id     = target_server.id
+    config.xui_uuid      = xui_result["uuid"]
+    config.xui_inbound_id = xui_result["inbound_id"]
+    config.vless_link    = None  # ссылка обновится при следующем /sub/{token}
+    config.sub_token     = generate_sub_token()
 
     # Шаг 4 — счётчик нового сервера
     target_server.current_users_count += 1
@@ -455,4 +464,4 @@ async def migrate_config(
         "new_server": target_server.name,
         "new_sub_url": f"/sub/{config.sub_token}",
         "days_remaining": days_left,
-    } 
+    }

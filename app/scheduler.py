@@ -4,7 +4,7 @@ from sqlalchemy import select, delete
 from datetime import datetime, timedelta
 from database.database import async_session
 from database.models import Config, VPNServer, Client, ServicePlan, Invoice, InvoiceStatus, LoginAttempt
-from app.services.marzban_service import delete_marzban_user, toggle_marzban_user
+from app.services.xui_service import delete_xui_client, toggle_xui_client
 from app.services.crypto_service import decrypt
 
 scheduler = AsyncIOScheduler()
@@ -61,13 +61,14 @@ async def process_expired_subscriptions():
 
                 if client.balance >= final_price:
                     # Продлеваем в Marzban — включаем если был выключен
-                    toggle_result = await toggle_marzban_user(
+                    toggle_result = await toggle_xui_client(
                         ip=server.ip_address,
                         ssh_port=server.ssh_port,
-                        marzban_port=server.marzban_port,
-                        mar_admin_user=admin_user,
-                        mar_admin_pass=admin_pass,
-                        marzban_username=config.marzban_username,
+                        panel_port=server.panel_port,
+                        xui_admin_user=admin_user,
+                        xui_admin_pass=admin_pass,
+                        xui_uuid=config.xui_uuid,
+            xui_inbound_id=config.xui_inbound_id,
                         active=True
                     )
 
@@ -83,30 +84,31 @@ async def process_expired_subscriptions():
                             status=InvoiceStatus.PAID,
                             external_id="auto_renew"
                         ))
-                        print(f"[Scheduler] Авто-продлено: {config.marzban_username}, списано {final_price}₽")
+                        print(f"[Scheduler] Авто-продлено: {config.xui_username}, списано {final_price}₽")
                         continue
                     else:
-                        print(f"[Scheduler] Ошибка авто-продления {config.marzban_username}: {toggle_result['error']}")
+                        print(f"[Scheduler] Ошибка авто-продления {config.xui_username}: {toggle_result['error']}")
 
                 else:
-                    print(f"[Scheduler] Авто-продление {config.marzban_username}: недостаточно баланса ({client.balance}₽ < {final_price}₽)")
+                    print(f"[Scheduler] Авто-продление {config.xui_username}: недостаточно баланса ({client.balance}₽ < {final_price}₽)")
 
             # --- Удаление (нет авто-продления или не хватило денег) ---
-            delete_result = await delete_marzban_user(
+            delete_result = await delete_xui_client(
                 ip=server.ip_address,
                 ssh_port=server.ssh_port,
-                marzban_port=server.marzban_port,
-                mar_admin_user=admin_user,
-                mar_admin_pass=admin_pass,
-                marzban_username=config.marzban_username
+                panel_port=server.panel_port,
+                xui_admin_user=admin_user,
+                xui_admin_pass=admin_pass,
+                xui_uuid=config.xui_uuid,
+                xui_inbound_id=config.xui_inbound_id,
             )
 
             if delete_result["success"]:
                 if server.current_users_count > 0:
                     server.current_users_count -= 1
-                print(f"[Scheduler] Удалён из Marzban: {config.marzban_username}")
+                print(f"[Scheduler] Удалён из 3x-ui: {config.xui_username}")
             else:
-                print(f"[Scheduler] Ошибка удаления {config.marzban_username}: {delete_result['error']}")
+                print(f"[Scheduler] Ошибка удаления {config.xui_uuid}: {delete_result['error']}")
 
             config.is_active = False
 

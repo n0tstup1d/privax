@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
+from database.models import InboundType
 
 
 # --- АВТОРИЗАЦИЯ ---
@@ -55,8 +56,9 @@ class ServicePlanCreate(BaseModel):
     description: Optional[str] = None
     tier_level: int                     # FK → ServerTier.level
     price: float                        # базовая цена ЗА МЕСЯЦ
-    months: int = 1
+    duration_days: int = 30  # длительность в днях: 3, 7, 30, 90, 180...
     discount_percent: float = 0.0
+    purchase_limit: int = 0             # 0 = безлимит, 1+ = максимум N покупок
 
 
 class ServicePlanUpdate(BaseModel):
@@ -64,8 +66,9 @@ class ServicePlanUpdate(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     price: Optional[float] = None
-    months: Optional[int] = None
+    duration_days: Optional[int] = None
     discount_percent: Optional[float] = None
+    purchase_limit: Optional[int] = None
 
 
 class ServicePlanResponse(BaseModel):
@@ -75,14 +78,15 @@ class ServicePlanResponse(BaseModel):
     description: Optional[str] = None
     tier_level: int
     price: float
-    months: int
+    duration_days: int
+    is_hidden: bool
     discount_percent: float
     final_price: float
     # max_sessions берётся из tier — не хранится в плане
 
     @classmethod
     def from_orm_with_price(cls, plan):
-        base  = plan.price * plan.months
+        base  = plan.price * (plan.duration_days / 30)
         final = round(base * (1 - plan.discount_percent / 100), 2)
         return cls(
             id=plan.id,
@@ -91,7 +95,8 @@ class ServicePlanResponse(BaseModel):
             description=plan.description,
             tier_level=plan.tier_level,
             price=plan.price,
-            months=plan.months,
+            duration_days=plan.duration_days,
+            is_hidden=plan.is_hidden,
             discount_percent=plan.discount_percent,
             final_price=final,
         )
@@ -105,15 +110,15 @@ class ServicePlanResponse(BaseModel):
 class VPNServerCreate(BaseModel):
     name: str
     ip_address: str
-    tier_level: int                 # FK → ServerTier.level
+    tier_level: int                 # FK -> ServerTier.level
     ssh_port: int = 22
-    ssh_user: str = "root"
-    ssh_password: str | None = None
-    mar_admin_user: str
-    mar_admin_pass: str
+    ssh_user: str = "root"          # SSH-пользователь для первичной настройки
+    ssh_password: str               # SSH-пароль для первичной настройки (после hardening вход по паролю отключается)
+    mar_admin_user: str             # логин 3x-ui
+    mar_admin_pass: str             # пароль 3x-ui
     country_code: str = "DE"
-    marzban_port: int = 8000
-    # max_users не нужен — берётся из ServerTier.default_max_users
+    panel_port: int = 2053          # порт 3x-ui панели
+    panel_path: str = ""               # секретный путь панели (например /IowuXQyUA8bB)
 
 
 class VPNServerUpdate(BaseModel):
@@ -122,7 +127,8 @@ class VPNServerUpdate(BaseModel):
     country_code: Optional[str] = None
     tier_level: Optional[int] = None
     ssh_port: Optional[int] = None
-    marzban_port: Optional[int] = None
+    panel_port: Optional[int] = None
+    panel_path: Optional[str] = None
     mar_admin_user: Optional[str] = None
     mar_admin_pass: Optional[str] = None
     is_active: Optional[bool] = None
@@ -137,9 +143,11 @@ class VPNServerResponse(BaseModel):
     ssh_port: int
     mar_admin_user: str
     current_users_count: int
-    max_users: int               # из ServerTier.default_max_users
-    marzban_port: int
+    max_users: int
+    panel_port: int
+    panel_path: str = ""
     is_active: bool
+    inbound_type: InboundType = InboundType.TCP_REALITY
     tier: Optional[ServerTierResponse] = None
 
     class Config:
@@ -151,6 +159,6 @@ class DomainCreate(BaseModel):
     country_code: Optional[str] = None
 
 class DomainUpdate(BaseModel):
-    domain: Optional[str] = None
+    domain: Optional[str] = None 
     country_code: Optional[str] = None
     is_active: Optional[bool] = None

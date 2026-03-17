@@ -1,3 +1,4 @@
+import math
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
@@ -41,17 +42,23 @@ async def get_my_profile(
             expired = c.expire_at < now
             devices_limit = plan.tier.max_sessions if plan and plan.tier else 1
             groups[gid] = {
-                "group_id":   gid,
-                "plan":       plan.name if plan else "Неизвестен",
-                "expires_at": c.expire_at.isoformat(),
-                "days_left":  max(0, (c.expire_at - now).days),
-                "expired":    expired,
-                "is_active":  c.is_active and not expired,
+                "group_id":           gid,
+                "plan":               plan.name if plan else "Неизвестен",
+                "plan_id":            plan.id if plan else None,
+                "plan_duration_days": plan.duration_days if plan else None,
+                "tier_level":         plan.tier_level if plan else None,
+                "expires_at":         c.expire_at.isoformat() + "Z",
+                "days_left":          max(0, math.ceil((c.expire_at - now).total_seconds() / 86400)),
+                "expired":            expired,
+                "is_active":          c.is_active and not expired,
                 "max_devices": devices_limit,
                 "maxDevices": devices_limit,
                 "device_limit": devices_limit,
                 "devices_limit": devices_limit,
                 "max_sessions": devices_limit,
+                "auto_renew":         getattr(c, "auto_renew", False),
+                "grace_period_end":    c.grace_period_end.isoformat() + "Z" if getattr(c, "grace_period_end", None) else None,
+                "next_reset_at":       c.last_reset_at.isoformat() + "Z" if getattr(c, "last_reset_at", None) else None,
                 "devices":    [],
             }
 
@@ -115,9 +122,10 @@ async def get_my_profile(
     ]
 
     return {
-        "id":      current_user.id,
-        "email":   current_user.email,
-        "balance": current_user.balance,
+        "id":            current_user.id,
+        "email":         current_user.email,
+        "balance":       current_user.balance,
+        "referred_by_id": current_user.referred_by_id,
         "subscriptions": {
             "active":  [g for g in all_groups if g["is_active"]],
             "expired": [g for g in all_groups if not g["is_active"]],

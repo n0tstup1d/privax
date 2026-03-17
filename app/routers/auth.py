@@ -2,9 +2,10 @@ import random
 import string
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt, JWTError
+from typing import Optional
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 from auth.deps import get_current_user
 from auth.security import get_password_hash, verify_password, create_tokens
 from database.database import get_db
-from database.models import Client, RefreshToken, Config, LoginAttempt, PasswordResetCode
+from database.models import Client, RefreshToken, Config, LoginAttempt, PasswordResetCode, Referral
 from schemas import Authorization
 
 load_dotenv()
@@ -22,16 +23,73 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM  = os.getenv("ALGORITHM")
 
+# Домен твоего сайта — для правильного scope cookies
+# Поставь в .env: SITE_DOMAIN=privax.com
+SITE_DOMAIN = os.getenv("SITE_DOMAIN", "localhost")
+IS_PROD     = os.getenv("ENV", "dev") == "prod"
+
 # --- Антибрутфорс ---
 MAX_ATTEMPTS   = 5    # попыток
-BRUTE_WINDOW   = 15   # минут — окно подсчёта
-BLOCK_DURATION = 30   # минут — длина блокировки
+BRUTE_WINDOW   = 15   # минут
+BLOCK_DURATION = 30   # минут
 
 # --- Сброс пароля ---
 RESET_TTL = 10  # минут
 
 
 router = APIRouter()
+
+
+# ═══════════════════════════════════════════════
+#  ME — проверка живой сессии
+# ═══════════════════════════════════════════════
+
+@router.get("/me")
+async def get_me(current_user: Client = Depends(get_current_user)):
+    """
+    Лёгкий эндпоинт для проверки валидности access_token.
+    Фронт вызывает при загрузке страницы (PrivateRoute).
+    200 — залогинен, 401 — нужен refresh.
+    """
+    return {"id": current_user.id, "email": current_user.email, "is_admin": current_user.is_admin}
+# ═══════════════════════════════════════════════
+
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str):
+    """
+    Кладёт токены в httpOnly cookies.
+
+    httpOnly=True  — JS вообще не видит куку, XSS бесполезен
+    secure=True    — только по HTTPS (в проде обязательно)
+    samesite="lax" — защита от CSRF для большинства случаев
+    """
+    # access_token: короткий TTL, читается на каждый запрос
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=IS_PROD,          # True на проде (HTTPS), False на localhost
+        samesite="lax",
+        max_age=60 * 30,         # 30 минут
+        domain=SITE_DOMAIN if IS_PROD else None,
+        path="/",
+    )
+    # refresh_token: долгий TTL, используется для /auth/refresh
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=IS_PROD,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,  # 30 дней
+        domain=SITE_DOMAIN if IS_PROD else None,
+        path="/",                    # path="/" — браузер шлёт на все запросы
+    )
+
+
+def _clear_auth_cookies(response: Response):
+    """Удаляет обе куки — используется при logout."""
+    response.delete_cookie("access_token",  path="/")
+    response.delete_cookie("refresh_token", path="/")
 
 
 # ═══════════════════════════════════════════════
@@ -47,7 +105,7 @@ def _serialize_config(c: Config) -> dict:
     return {
         "id": c.id,
         "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
-        "expires_at": c.expire_at.isoformat(),
+        "expires_at": c.expire_at.isoformat() + "Z",
         "expired": c.expire_at < now,
         "auto_renew": c.auto_renew,
     }
@@ -131,8 +189,18 @@ class ConfirmResetRequest(BaseModel):
 #  РЕГИСТРАЦИЯ
 # ═══════════════════════════════════════════════
 
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    ref_code: Optional[str] = None
+
+
 @router.post("/register")
-async def register_client(body: Authorization, db: AsyncSession = Depends(get_db)):
+async def register_client(
+    body: RegisterRequest,
+    response: Response,             # ← добавлен response для установки cookies
+    db: AsyncSession = Depends(get_db)
+):
     result = await db.execute(select(Client).filter(Client.email == body.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Почта уже занята")
@@ -141,15 +209,24 @@ async def register_client(body: Authorization, db: AsyncSession = Depends(get_db
     db.add(new_client)
     await db.flush()
 
+    if body.ref_code:
+        referrer_q = await db.execute(
+            select(Client).where(Client.referral_code == body.ref_code.upper())
+        )
+        referrer = referrer_q.scalar_one_or_none()
+        if referrer and referrer.id != new_client.id:
+            new_client.referred_by_id = referrer.id
+            db.add(Referral(referrer_id=referrer.id, referred_id=new_client.id))
+
     access_token, refresh_token = create_tokens({"sub": str(new_client.id)})
     db.add(RefreshToken(token=refresh_token, client=new_client))
     await db.commit()
 
+    # Кладём токены в httpOnly cookies — в тело НЕ возвращаем
+    _set_auth_cookies(response, access_token, refresh_token)
+
     return {
         "status": "registered",
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
         "subscriptions": []
     }
 
@@ -161,6 +238,7 @@ async def register_client(body: Authorization, db: AsyncSession = Depends(get_db
 @router.post("/login")
 async def login_user(
     request: Request,
+    response: Response,             # ← добавлен response
     body: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
 ):
@@ -181,13 +259,14 @@ async def login_user(
     db.add(RefreshToken(token=refresh_token, client_id=client.id))
     await db.commit()
 
+    # Кладём в cookies — токены в JSON не возвращаем
+    _set_auth_cookies(response, access_token, refresh_token)
+
     configs = await _get_user_configs(client.id, db)
     serialized = [_serialize_config(c) for c in configs]
 
     return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
+        "status": "ok",
         "subscriptions": {
             "active":  [c for c in serialized if not c["expired"]],
             "expired": [c for c in serialized if c["expired"]],
@@ -200,12 +279,22 @@ async def login_user(
 # ═══════════════════════════════════════════════
 
 @router.post("/refresh")
-async def refresh_session(refresh_token: str, db: AsyncSession = Depends(get_db)):
+async def refresh_session(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db)
+):
+    # Читаем refresh_token из httpOnly cookie
+    refresh_token = request.cookies.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Сессия не найдена. Войдите заново.")
+
     result = await db.execute(
         select(RefreshToken).filter(RefreshToken.token == refresh_token)
     )
     db_token = result.scalar_one_or_none()
     if not db_token:
+        _clear_auth_cookies(response)
         raise HTTPException(status_code=401, detail="Сессия не найдена. Войдите заново.")
 
     try:
@@ -214,19 +303,21 @@ async def refresh_session(refresh_token: str, db: AsyncSession = Depends(get_db)
     except JWTError:
         await db.delete(db_token)
         await db.commit()
+        _clear_auth_cookies(response)
         raise HTTPException(status_code=401, detail="Срок сессии истёк")
 
     new_access, new_refresh = create_tokens({"sub": client_id})
     db_token.token = new_refresh
     await db.commit()
 
+    # Обновляем обе cookies
+    _set_auth_cookies(response, new_access, new_refresh)
+
     configs = await _get_user_configs(int(client_id), db)
     serialized = [_serialize_config(c) for c in configs]
 
     return {
-        "access_token": new_access,
-        "refresh_token": new_refresh,
-        "token_type": "bearer",
+        "status": "ok",
         "subscriptions": {
             "active":  [c for c in serialized if not c["expired"]],
             "expired": [c for c in serialized if c["expired"]],
@@ -235,21 +326,30 @@ async def refresh_session(refresh_token: str, db: AsyncSession = Depends(get_db)
 
 
 @router.post("/logout")
-async def logout(refresh_token: str, db: AsyncSession = Depends(get_db)):
-    await db.execute(
-        delete(RefreshToken).where(RefreshToken.token == refresh_token)
-    )
-    await db.commit()
+async def logout(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db)
+):
+    refresh_token = request.cookies.get("refresh_token")
+    if refresh_token:
+        await db.execute(
+            delete(RefreshToken).where(RefreshToken.token == refresh_token)
+        )
+        await db.commit()
+
+    _clear_auth_cookies(response)
     return {"status": "Вы вышли из аккаунта"}
 
 
 # ═══════════════════════════════════════════════
-#  СМЕНА ПАРОЛЯ (знает старый)
+#  СМЕНА ПАРОЛЯ
 # ═══════════════════════════════════════════════
 
 @router.post("/change-password")
 async def change_password(
     body: ChangePasswordRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: Client = Depends(get_current_user)
 ):
@@ -264,11 +364,14 @@ async def change_password(
         delete(RefreshToken).where(RefreshToken.client_id == current_user.id)
     )
     await db.commit()
+
+    # Сбрасываем cookies — нужно войти заново
+    _clear_auth_cookies(response)
     return {"status": "Пароль изменён. Войдите заново."}
 
 
 # ═══════════════════════════════════════════════
-#  СБРОС ПАРОЛЯ (забыл пароль)
+#  СБРОС ПАРОЛЯ
 # ═══════════════════════════════════════════════
 
 @router.post("/reset-password")
@@ -277,16 +380,6 @@ async def reset_password_request(
     body: ResetPasswordRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Шаг 1: запрашиваем сброс.
-
-    Сейчас код печатается в консоль сервера.
-    Когда подключишь email — в этом файле найди строку
-    '# TODO: заменить на email' и замени print() на send_email().
-
-    Всегда возвращаем одинаковый ответ — чтобы нельзя было
-    перебором определить существующие email.
-    """
     ip = request.client.host
     await _check_brute_force(body.email, ip, db)
 
@@ -294,7 +387,6 @@ async def reset_password_request(
     client = result.scalar_one_or_none()
 
     if client:
-        # Удаляем старые неиспользованные коды
         await db.execute(
             delete(PasswordResetCode).where(
                 PasswordResetCode.client_id == client.id,
@@ -311,7 +403,6 @@ async def reset_password_request(
         await db.commit()
 
         # TODO: заменить на email когда подключишь SMTP
-        # await send_password_reset(client.email, code)
         print(f"\n{'='*40}")
         print(f"[RESET PASSWORD] Email: {client.email}")
         print(f"[RESET PASSWORD] Code:  {code}")
@@ -328,7 +419,6 @@ async def reset_password_confirm(
     body: ConfirmResetRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Шаг 2: подтверждаем код и устанавливаем новый пароль."""
     if len(body.new_password) < 8:
         raise HTTPException(status_code=400, detail="Пароль должен быть не менее 8 символов")
 
@@ -352,7 +442,6 @@ async def reset_password_confirm(
     reset_code.is_used = True
     client.password = get_password_hash(body.new_password)
 
-    # Инвалидируем все сессии
     await db.execute(
         delete(RefreshToken).where(RefreshToken.client_id == client.id)
     )
