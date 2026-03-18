@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from sqlalchemy.orm import selectinload
+import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Optional
@@ -21,6 +22,8 @@ router = APIRouter()
 
 # Кулдаун между сбросами устройств (в часах)
 RESET_COOLDOWN_HOURS = 1
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _calc_final_price(plan: ServicePlan, extra_discount: float = 0.0) -> float:
@@ -326,7 +329,10 @@ async def buy_subscription(
         base_path=decrypt(server.panel_path) if server.panel_path else ""
     )
 
-    expire_at = datetime.utcnow() + timedelta(days=expire_days)
+    # Считаем expire_at до конца дня (23:59:59 UTC) через N дней
+    # Это убирает баг когда панель (в локальной TZ сервера) показывает день меньше
+    _base = datetime.utcnow() + timedelta(days=expire_days)
+    expire_at = _base.replace(hour=23, minute=59, second=59, microsecond=0)
 
     # Шаг 7
     new_config = Config(
@@ -393,7 +399,10 @@ async def get_my_subscriptions(
 ):
     result = await db.execute(
         select(Config)
-        .options(selectinload(Config.plan).selectinload(ServicePlan.tier))
+        .options(
+            selectinload(Config.plan).selectinload(ServicePlan.tier),
+            selectinload(Config.server),
+        )
         .where(Config.client_id == current_user.id)
         .order_by(Config.expire_at.desc())
     )
@@ -416,6 +425,8 @@ async def get_my_subscriptions(
             "last_reset_at": c.last_reset_at.isoformat() + "Z" if c.last_reset_at else None,
             "next_reset_at": (c.last_reset_at + timedelta(hours=RESET_COOLDOWN_HOURS)).isoformat() + "Z" if c.last_reset_at else None,
             "reset_cooldown_hours": RESET_COOLDOWN_HOURS,
+            "server_name": c.server.name if c.server else None,
+            "server_ip": c.server.ip_address if c.server else None,
         }
         for c in configs
     ]
@@ -617,6 +628,32 @@ async def reset_subscription(
     }
 
 
+
+@router.get("/{config_id}/server-status")
+async def get_server_status(
+    config_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: Client = Depends(get_current_user),
+):
+    """
+    Статус VPN-сервера — читается из БД, обновляется фоновой задачей каждые 5 мин.
+    Возвращает { online: bool, last_checked_at: str | null }
+    """
+    result = await db.execute(
+        select(Config)
+        .options(selectinload(Config.server))
+        .where(Config.id == config_id, Config.client_id == current_user.id)
+    )
+    config = result.scalar_one_or_none()
+    if not config or not config.server:
+        raise HTTPException(status_code=404, detail="Подписка не найдена")
+
+    server = config.server
+    return {
+        "online": server.is_online,
+        "last_checked_at": server.last_checked_at.isoformat() + "Z" if server.last_checked_at else None,
+    }
+
 @router.delete("/{config_id}")
 async def delete_subscription(
     config_id: int,
@@ -720,4 +757,4 @@ async def delete_all_subscriptions(
         "status": "ok",
         "deleted": deleted,
         "errors": errors if errors else None, 
-    }
+    } 

@@ -193,6 +193,10 @@ class VPNServer(Base):
     current_users_count: Mapped[int] = mapped_column(default=0)
     is_active: Mapped[bool] = mapped_column(default=True)
 
+    # Статус доступности — обновляется фоновой задачей каждые 5 минут
+    is_online: Mapped[bool] = mapped_column(default=True)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
     inbound_type: Mapped[InboundType] = mapped_column(
         Enum(InboundType, values_callable=lambda x: [e.value for e in x]),
         default=InboundType.TCP_REALITY

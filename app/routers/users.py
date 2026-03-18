@@ -48,7 +48,7 @@ async def get_my_profile(
                 "plan_duration_days": plan.duration_days if plan else None,
                 "tier_level":         plan.tier_level if plan else None,
                 "expires_at":         c.expire_at.isoformat() + "Z",
-                "days_left":          max(0, math.ceil((c.expire_at - now).total_seconds() / 86400)),
+                "days_left":          max(0, math.floor((c.expire_at - now).total_seconds() / 86400)),
                 "expired":            expired,
                 "is_active":          c.is_active and not expired,
                 "max_devices": devices_limit,

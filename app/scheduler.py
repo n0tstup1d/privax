@@ -2,12 +2,53 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select, delete
 from datetime import datetime, timedelta
+import asyncio
 from database.database import async_session
 from database.models import Config, VPNServer, Client, ServicePlan, Invoice, InvoiceStatus, LoginAttempt
 from app.services.xui_service import delete_xui_client, toggle_xui_client
 from app.services.crypto_service import decrypt
 
 scheduler = AsyncIOScheduler()
+
+
+async def check_servers_online():
+    """
+    Запускается каждые 5 минут.
+    Пингует все активные серверы через TCP connect на порт 443,
+    обновляет is_online и last_checked_at в БД.
+    """
+    print(f"[Scheduler] Проверка доступности серверов — {datetime.utcnow()}")
+
+    async with async_session() as db:
+        result = await db.execute(select(VPNServer).where(VPNServer.is_active == True))
+        servers = result.scalars().all()
+
+        if not servers:
+            return
+
+        async def ping(server: VPNServer):
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(server.ip_address, 443),
+                    timeout=5.0,
+                )
+                writer.close()
+                await writer.wait_closed()
+                return server.id, True
+            except Exception:
+                return server.id, False
+
+        results = await asyncio.gather(*[ping(s) for s in servers])
+
+        server_map = {s.id: s for s in servers}
+        for server_id, online in results:
+            server_map[server_id].is_online = online
+            server_map[server_id].last_checked_at = datetime.utcnow()
+            if not online:
+                print(f"[Scheduler] Сервер {server_map[server_id].name} ({server_map[server_id].ip_address}) — НЕДОСТУПЕН")
+
+        await db.commit()
+        print(f"[Scheduler] Проверено серверов: {len(servers)}, недоступных: {sum(1 for _, ok in results if not ok)}")
 
 
 async def process_expired_subscriptions():
@@ -143,6 +184,13 @@ def start_scheduler():
         trigger=IntervalTrigger(hours=24),
         id="cleanup_attempts",
         replace_existing=True
+    )
+    scheduler.add_job(
+        check_servers_online,
+        trigger=IntervalTrigger(minutes=5),
+        id="check_servers_online",
+        replace_existing=True,
+        next_run_time=datetime.utcnow(),  # запустить сразу при старте
     )
     scheduler.start()
     print("[Scheduler] Запущен.")
