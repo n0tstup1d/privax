@@ -6,8 +6,6 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Optional
 from pydantic import BaseModel
-import json
-import logging
 
 from auth.deps import get_current_user
 from database.database import get_db
@@ -22,7 +20,7 @@ from app.services.marzban_service import (
     get_marzban_user,
 )
 from app.services.crypto_service import decrypt
-from app.services.link_generator import generate_sub_token, build_sub_url
+from app.services.link_generator import generate_sub_token
 
 router = APIRouter()
 
@@ -95,21 +93,12 @@ async def _find_working_server(tier_level: int, db: AsyncSession) -> VPNServer:
     )
 
 
-def _clean_vless_name(link: str, username: str) -> str:
-    """Заменяет 🚀 Marz (username) [VLESS - tcp] на просто username."""
-    from urllib.parse import quote
-    if "#" in link:
-        base = link.split("#")[0]
-        return f"{base}#{quote(username)}"
-    return link
-
-
-def _pick_vless_link(links: list, username: str = "") -> Optional[str]:
-    """Выбирает первую vless:// ссылку и чистит название."""
+def _pick_vless_link(links: list) -> Optional[str]:
+    """Выбирает первую vless:// ссылку из списка links."""
     for link in links:
-        if isinstance(link, str) and link.startswith("vless://"):
-            return _clean_vless_name(link, username) if username else link
-    return None
+        if link.startswith("vless://"):
+            return link
+    return links[0] if links else None
 
 
 # --- ЭНДПОИНТЫ ---
@@ -234,8 +223,25 @@ async def buy_subscription(
             detail=f"Недостаточно средств. Нужно: {final_price}₽, у вас: {current_user.balance}₽"
         )
 
-    # max_sessions используется для ограничения устройств внутри подписки,
-    # а не количества покупок — покупки ограничиваются только purchase_limit
+    # Шаг 3.5 — лимит одновременных подписок
+    if plan.tier:
+        active_configs_q = await db.execute(
+            select(Config)
+            .join(ServicePlan, Config.plan_id == ServicePlan.id)
+            .where(
+                Config.client_id == current_user.id,
+                Config.is_active == True,
+                Config.expire_at > datetime.utcnow(),
+                ServicePlan.tier_level == plan.tier_level,
+            )
+        )
+        active_count = len(active_configs_q.scalars().all())
+        if active_count >= plan.tier.max_sessions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Достигнут лимит подписок для этого уровня — максимум {plan.tier.max_sessions}. "
+                       f"Удалите одну из существующих подписок чтобы купить новую."
+            )
 
     # Шаг 4 — сервер
     server = await _find_working_server(plan.tier_level, db)
@@ -244,12 +250,13 @@ async def buy_subscription(
 
     # Шаг 5 — генерируем username
     short_uuid = uuid4().hex[:4]
-    mar_username = f"tugoka_{current_user.id}_{short_uuid}"
+    mar_username = f"privax_{current_user.id}_{short_uuid}"
     sub_token = generate_sub_token()
     expire_days = plan.duration_days
 
     # inbounds для нового пользователя (берём из сервера, если есть)
-    _raw_inbounds = json.loads(server.inbounds_json) if server.inbounds_json else {}
+    import json as _json
+    _raw_inbounds = _json.loads(server.inbounds_json) if server.inbounds_json else {}
     # Нормализуем: Marzban API ожидает {"vless": ["TAG"]}, а в БД хранится {"vless": [{"tag": "TAG", ...}]}
     inbounds = {
         proto: [item["tag"] if isinstance(item, dict) else item for item in items]
@@ -267,12 +274,13 @@ async def buy_subscription(
     )
 
     if not mar_result["success"]:
-        logging.getLogger("tugoka.subscriptions").error(f"create_marzban_user failed: {mar_result.get('error')}")
+        import logging
+        logging.error(f"[BUY] create_marzban_user failed: {mar_result.get('error')}")
         raise HTTPException(status_code=500, detail="ERR_CLIENT_CREATE")
 
     subscription_url = mar_result.get("subscription_url", "")
     links = mar_result.get("links", [])
-    vless_link = _pick_vless_link(links, mar_username)
+    vless_link = _pick_vless_link(links)
 
     # expire_at — конец дня через N дней
     _base = datetime.utcnow() + timedelta(days=expire_days)
@@ -313,27 +321,13 @@ async def buy_subscription(
         from app.routers.referrals import grant_referral_bonus
         await grant_referral_bonus(current_user.id, db)
 
-    # Шаг 10 — запись события подписки
-    await db.flush()  # чтобы new_config.id был присвоен
-    from app.services.event_service import log_sub_event
-    from database.models import SubscriptionEventType
-    await log_sub_event(db, config_id=new_config.id, client_id=current_user.id,
-        event_type=SubscriptionEventType.PURCHASED,
-        description=f"Покупка: {plan.name} на {plan.duration_days} дн. за {final_price}₽",
-        details={
-            "plan_id": plan.id, "plan_name": plan.name,
-            "price": final_price, "duration_days": plan.duration_days,
-            "server": server.name, "discount": extra_discount,
-        },
-    )
-
     await db.commit()
 
     max_devices = plan.tier.max_sessions if plan.tier else None
 
     return {
         "status": "Подписка активирована!",
-        "sub_url": build_sub_url(sub_token),
+        "sub_url": f"/sub/{sub_token}",
         "subscription_url": subscription_url,
         "expires_at": expire_at.isoformat() + "Z",
         "server": server.name,
@@ -344,7 +338,7 @@ async def buy_subscription(
         "amount_paid": final_price,
         "discount_applied": extra_discount if extra_discount else None,
         "referral_discount": referral_discount_applied,
-        "note": "Вставьте subscription_url в приложение — ссылка обновляется автоматически"
+        "note": "Вставьте subscription_url в AmneziaVPN — ссылка обновляется автоматически"
     }
 
 
@@ -368,7 +362,7 @@ async def get_my_subscriptions(
     return [
         {
             "id": c.id,
-            "sub_url": build_sub_url(c.sub_token),
+            "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
             "subscription_url": c.subscription_url,
             "expires_at": c.expire_at.isoformat() + "Z",
             "expired": c.expire_at < now,
@@ -478,11 +472,12 @@ async def reset_subscription(
 
     # Шаг 3 — новый username
     short_uuid = uuid4().hex[:4]
-    new_mar_username = f"tugoka_{current_user.id}_{short_uuid}"
+    new_mar_username = f"privax_{current_user.id}_{short_uuid}"
     new_sub_token = generate_sub_token()
 
     # Шаг 4 — создаём нового пользователя с тем же expire
-    _raw_inbounds = json.loads(server.inbounds_json) if server.inbounds_json else {}
+    import json as _json
+    _raw_inbounds = _json.loads(server.inbounds_json) if server.inbounds_json else {}
     # Нормализуем: Marzban API ожидает {"vless": ["TAG"]}, а в БД хранится {"vless": [{"tag": "TAG", ...}]}
     inbounds = {
         proto: [item["tag"] if isinstance(item, dict) else item for item in items]
@@ -502,7 +497,7 @@ async def reset_subscription(
         raise HTTPException(status_code=500, detail="ERR_RESET_CREATE")
 
     new_links = create_result.get("links", [])
-    new_vless_link = _pick_vless_link(new_links, new_mar_username)
+    new_vless_link = _pick_vless_link(new_links)
     new_subscription_url = create_result.get("subscription_url", "")
 
     # Шаг 5 — обновляем в БД
@@ -512,15 +507,6 @@ async def reset_subscription(
     config.sub_token = new_sub_token
     config.expire_at = exact_expire_at
     config.last_reset_at = datetime.utcnow()
-
-    # Событие подписки
-    from app.services.event_service import log_sub_event
-    from database.models import SubscriptionEventType
-    await log_sub_event(db, config_id=config.id, client_id=current_user.id,
-        event_type=SubscriptionEventType.RESET,
-        description="Сброс устройств — новый ключ сгенерирован",
-    )
-
     await db.commit()
 
     next_reset_at = config.last_reset_at + timedelta(hours=RESET_COOLDOWN_HOURS)
@@ -528,9 +514,8 @@ async def reset_subscription(
     return {
         "status": "ok",
         "message": "Подписка сброшена. Все устройства отключены.",
-        "vless_link": new_vless_link,
         "subscription_url": new_subscription_url,
-        "sub_url": build_sub_url(new_sub_token),
+        "sub_url": f"/sub/{new_sub_token}",
         "next_reset_at": next_reset_at.isoformat() + "Z",
         "cooldown_hours": RESET_COOLDOWN_HOURS,
     }
@@ -543,7 +528,7 @@ async def get_server_status(
     current_user: Client = Depends(get_current_user),
 ):
     """
-    Статус сервера — читается из БД, обновляется фоновой задачей каждые 5 мин.
+    Статус VPN-сервера — читается из БД, обновляется фоновой задачей каждые 5 мин.
     """
     result = await db.execute(
         select(Config)

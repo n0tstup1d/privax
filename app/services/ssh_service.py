@@ -10,7 +10,7 @@ harden_server() вызывается при POST /admin/servers/add автома
   4. После этого все дальнейшие подключения — только по ключу
 
 Что настраивается:
-  UFW      — блокируем всё входящее, открываем SSH-порт и 443 для VPN.
+  UFW      — блокируем всё входящее, открываем SSH-порт и 443 для туннеля.
              panel_port ЗАКРЫТ снаружи — доступен только через SSH-туннель.
   SSH      — отключаем вход по паролю, оставляем только ключ.
   fail2ban — блокирует IP после 5 неудачных попыток SSH за 10 минут.
@@ -58,7 +58,7 @@ def _build_connect_kwargs(
 async def harden_server(
     ip: str,
     ssh_port: int,
-    panel_port: int,
+    marzban_port: int | None = None,
     ssh_user: str = "root",
     ssh_password: str | None = None,
 ) -> dict:
@@ -72,7 +72,7 @@ async def harden_server(
     1. Подключение (пароль или ключ)
     2. Установка нашего публичного ключа в authorized_keys
     3. apt: ufw + fail2ban
-    4. UFW: default deny, allow SSH + 443, deny panel_port снаружи
+    4. UFW: default deny, allow SSH + 443 + marzban_port (открываем, не закрываем)
     5. SSH: только ключевая аутентификация
     6. fail2ban: 5 попыток -> бан 1 час
     7. Перезапуск сервисов
@@ -124,30 +124,42 @@ async def harden_server(
             "UFW: запрет всех входящих"
         ),
         (f"ufw allow {ssh_port}/tcp comment 'SSH'", f"UFW: SSH на порту {ssh_port}"),
-        ("ufw allow 443/tcp comment 'VPN Reality'", "UFW: 443 для VPN (Reality/HTTPS)"),
-        (
-            f"ufw deny {panel_port}/tcp comment 'panel — только SSH-туннель'",
-            f"UFW: панель {panel_port} закрыта снаружи"
+        ("ufw allow 443/tcp comment 'Tunnel VLESS'", "UFW: 443 для VLESS Reality"),
+        *(
+            [(
+                f"ufw allow {marzban_port}/tcp comment 'Marzban API'",
+                f"UFW: Marzban API на порту {marzban_port} открыт"
+            )]
+            if marzban_port and marzban_port not in (443, ssh_port)
+            else []
         ),
         ("ufw --force enable", "UFW: включаем файрвол"),
-        # TODO: раскомментить когда fail2ban будет нужен
-        # (
-        #     "cat > /etc/fail2ban/jail.local << 'EOF'\n"
-        #     "[DEFAULT]\n"
-        #     "bantime  = 3600\n"
-        #     "findtime = 600\n"
-        #     "maxretry = 5\n\n"
-        #     "[sshd]\n"
-        #     "enabled  = true\n"
-        #     f"port     = {ssh_port}\n"
-        #     "filter   = sshd\n"
-        #     "logpath  = /var/log/auth.log\n"
-        #     "maxretry = 3\n"
-        #     "bantime  = 86400\n"
-        #     "EOF",
-        #     "fail2ban: 3 попытки → бан 24 ч"
-        # ),
-        # ("systemctl enable fail2ban && systemctl restart fail2ban", "fail2ban: запуск"),
+        # NAT для трафика — без этого клиенты подключаются но интернет не работает
+        (
+            "IFACE=$(ip route | grep default | awk '{print $5}') && "
+            "iptables -t nat -C POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null || "
+            "iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE",
+            "NAT: IPv4 MASQUERADE"
+        ),
+        (
+            "IFACE=$(ip route | grep default | awk '{print $5}') && "
+            "ip6tables -t nat -C POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null || "
+            "ip6tables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE",
+            "NAT: IPv6 MASQUERADE"
+        ),
+        (
+            "sysctl -w net.ipv4.ip_forward=1 && "
+            "grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf && "
+            "sed -i 's/^#*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || "
+            "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf",
+            "Sysctl: IP forwarding"
+        ),
+        # Сохраняем правила чтобы не слетали при ребуте
+        (
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq netfilter-persistent iptables-persistent && "
+            "netfilter-persistent save",
+            "Сохранение правил iptables"
+        ),
         ("systemctl restart sshd || systemctl restart ssh", "SSH: перезапуск на новом порту"),
     ]
 
@@ -177,8 +189,9 @@ async def harden_server(
             "details": details,
             "summary": (
                 f"Ключ установлен | "
-                f"UFW: SSH ({ssh_port}) + 443 открыты, панель {panel_port} закрыта снаружи | "
-                f"SSH: только ключ | fail2ban: 5 попыток -> бан 1 ч"
+                f"UFW: SSH ({ssh_port}) + 443 (VLESS)"
+                + (f" + Marzban ({marzban_port})" if marzban_port and marzban_port not in (443, ssh_port) else "")
+                + " открыты | SSH: только ключ"
             )
         }
 
@@ -209,3 +222,67 @@ async def check_ssh_connection(ip: str, ssh_port: int, ssh_user: str = "root") -
         return {"success": False, "error": "SSH: ключ не подошёл"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+async def generate_reality_keys(
+    ip: str,
+    ssh_port: int,
+    ssh_user: str = "root",
+    container_name: str = "marzban-marzban-1",
+) -> dict:
+    """
+    Генерирует пару X25519 ключей для Reality через xray x25519
+    внутри Marzban-контейнера на сервере.
+
+    Возвращает:
+        {"success": True, "private_key": "...", "public_key": "..."}
+    """
+    import re
+    try:
+        async with asyncssh.connect(
+            host=ip,
+            port=ssh_port,
+            username=ssh_user,
+            client_keys=[SSH_KEY_PATH],
+            known_hosts=None
+        ) as conn:
+            result = await conn.run(
+                f"docker exec {container_name} xray x25519",
+                check=False
+            )
+
+            if result.returncode != 0:
+                # Пробуем найти контейнер автоматически
+                find_result = await conn.run(
+                    "docker ps --format '{{.Names}}' | grep -i marzban | head -1",
+                    check=False
+                )
+                found_name = find_result.stdout.strip()
+                if not found_name:
+                    return {"success": False, "error": "Marzban-контейнер не найден. Проверьте docker ps"}
+
+                result = await conn.run(
+                    f"docker exec {found_name} xray x25519",
+                    check=False
+                )
+                if result.returncode != 0:
+                    return {"success": False, "error": f"xray x25519 завершился с ошибкой: {result.stderr}"}
+
+            output = result.stdout
+            priv_match = re.search(r"Private key:\s*(\S+)", output)
+            pub_match  = re.search(r"Public key:\s*(\S+)", output)
+
+            if not priv_match or not pub_match:
+                return {"success": False, "error": f"Не удалось разобрать вывод xray x25519: {output}"}
+
+            return {
+                "success": True,
+                "private_key": priv_match.group(1),
+                "public_key":  pub_match.group(1),
+            }
+
+    except asyncssh.DisconnectError:
+        return {"success": False, "error": "SSH: сервер недоступен"}
+    except asyncssh.PermissionDenied:
+        return {"success": False, "error": "SSH: ключ не подошёл"}
+    except Exception as e:
+        return {"success": False, "error": f"Ошибка генерации ключей: {str(e)}"} 

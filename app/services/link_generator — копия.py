@@ -1,26 +1,6 @@
 import secrets
 import random
-import os
 from urllib.parse import quote
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Базовый URL API для формирования полных ссылок подписки
-# Пример: https://api.privax.com
-# Если не задан — формируются относительные пути (работают только через Vite proxy)
-API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
-
-
-def build_sub_url(sub_token: str | None) -> str | None:
-    """
-    Формирует полный URL подписки для клиентского приложения.
-    Если API_BASE_URL задан: https://api.privax.com/sub/TOKEN
-    Если нет: /sub/TOKEN (для dev-режима через Vite proxy)
-    """
-    if not sub_token:
-        return None
-    return f"{API_BASE_URL}/sub/{sub_token}"
 
 # Fingerprints — имитируем разные браузеры
 FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge"]

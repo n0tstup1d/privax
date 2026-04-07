@@ -1,31 +1,24 @@
 import math
-import json
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
-from uuid import uuid4
-from urllib.parse import quote
 
 from auth.deps import get_admin_from_jwt, require_role
 from database.database import get_db
 from database.models import (
-    Client, Config, VPNServer, ServicePlan, ServerTier,
-    Invoice, InvoiceStatus, AdminRole,
-    SubscriptionEvent, SubscriptionEventType,
-    NotificationType,
+    Client, Config, VPNServer, ServicePlan,
+    Invoice, InvoiceStatus, AdminRole
 )
 from app.services.marzban_service import (
     toggle_marzban_user, delete_marzban_user,
     create_marzban_user, extend_marzban_user,
 )
 from app.services.crypto_service import decrypt
-from app.services.link_generator import generate_sub_token, build_sub_url
-from app.services.event_service import log_sub_event, log_admin_action, notify_client, notify_admins
-from database.models import AdminActionType, AdminNotifType
+from app.services.link_generator import generate_sub_token
 
 router = APIRouter()
 
@@ -123,7 +116,7 @@ async def get_client_profile(
         configs_data.append({
             "id": c.id,
             "mar_username": c.mar_username,
-            "sub_url": build_sub_url(c.sub_token),
+            "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
             "subscription_url": c.subscription_url,
             "status": "active" if c.is_active and c.expire_at > now else "expired" if c.expire_at < now else "disabled",
             "expire_at": c.expire_at.isoformat() + "Z",
@@ -477,262 +470,3 @@ async def get_overview(
         "summary": {"total_clients": total_clients, "total_revenue": round(total_revenue or 0, 2)},
         "servers": servers_data,
     }
-
-
-# ═══════════════════════════════════════════════
-#  ПЕРЕНОС ПОДПИСКИ НА ДРУГОЙ СЕРВЕР
-# ═══════════════════════════════════════════════
-
-class MigrateRequest(BaseModel):
-    target_server_id: int
-
-
-def _clean_vless_name(link: str, username: str) -> str:
-    if "#" in link:
-        base = link.split("#")[0]
-        return f"{base}#{quote(username)}"
-    return link
-
-
-def _normalize_inbounds(inbounds_json_str: str) -> dict:
-    if not inbounds_json_str:
-        return {"vless": ["VLESS TCP REALITY"]}
-    raw = json.loads(inbounds_json_str) if isinstance(inbounds_json_str, str) else inbounds_json_str
-    return {
-        proto: [item["tag"] if isinstance(item, dict) else item for item in items]
-        for proto, items in raw.items()
-    }
-
-
-@router.post("/clients/{client_id}/configs/{config_id}/migrate")
-async def migrate_subscription(
-    client_id: int,
-    config_id: int,
-    body: MigrateRequest,
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    admin=Depends(_owner_or_op),
-):
-    """
-    Переносит подписку клиента на другой сервер.
-
-    1. Проверяет что целевой сервер того же тира и есть свободные слоты
-    2. Удаляет пользователя из старого Marzban
-    3. Создаёт на новом с тем же сроком действия
-    4. Обновляет Config в БД
-    5. Уведомляет клиента + записывает событие + аудит-лог
-    """
-    admin_client, admin_profile = admin
-
-    # Загружаем конфиг
-    result = await db.execute(
-        select(Config)
-        .options(
-            selectinload(Config.server).selectinload(VPNServer.tier),
-            selectinload(Config.plan),
-        )
-        .where(Config.id == config_id, Config.client_id == client_id)
-    )
-    config = result.scalar_one_or_none()
-    if not config:
-        raise HTTPException(status_code=404, detail="Подписка не найдена")
-    if not config.is_active:
-        raise HTTPException(status_code=400, detail="Подписка неактивна")
-
-    old_server = config.server
-    if not old_server:
-        raise HTTPException(status_code=500, detail="Старый сервер не найден")
-
-    # Целевой сервер
-    target_result = await db.execute(
-        select(VPNServer)
-        .options(selectinload(VPNServer.tier))
-        .where(VPNServer.id == body.target_server_id)
-    )
-    target_server = target_result.scalar_one_or_none()
-    if not target_server:
-        raise HTTPException(status_code=404, detail="Целевой сервер не найден")
-    if not target_server.is_active:
-        raise HTTPException(status_code=400, detail="Целевой сервер деактивирован")
-    if target_server.tier_level != old_server.tier_level:
-        raise HTTPException(status_code=400, detail="Серверы разных тиров — перенос невозможен")
-
-    # Проверка слотов
-    max_users = target_server.tier.default_max_users if target_server.tier else 0
-    if target_server.current_users_count >= max_users:
-        raise HTTPException(status_code=409, detail="На целевом сервере нет свободных слотов")
-
-    if target_server.id == old_server.id:
-        raise HTTPException(status_code=400, detail="Подписка уже на этом сервере")
-
-    # Удаляем из старого Marzban
-    old_admin_user = decrypt(old_server.mar_admin_user)
-    old_admin_pass = decrypt(old_server.mar_admin_pass)
-
-    del_result = await delete_marzban_user(
-        marzban_url=old_server.marzban_url,
-        admin_username=old_admin_user,
-        admin_password=old_admin_pass,
-        username=config.mar_username,
-    )
-
-    # Создаём на новом
-    new_admin_user = decrypt(target_server.mar_admin_user)
-    new_admin_pass = decrypt(target_server.mar_admin_pass)
-
-    new_mar_username = f"privax_{client_id}_{uuid4().hex[:4]}"
-    new_sub_token = generate_sub_token()
-    inbounds = _normalize_inbounds(target_server.inbounds_json)
-
-    create_result = await create_marzban_user(
-        marzban_url=target_server.marzban_url,
-        admin_username=new_admin_user,
-        admin_password=new_admin_pass,
-        username=new_mar_username,
-        expire_days=0,
-        expire_at=config.expire_at,
-        inbounds=inbounds,
-    )
-
-    if not create_result.get("success"):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Не удалось создать пользователя на новом сервере: {create_result.get('error')}"
-        )
-
-    # Обновляем Config
-    links = create_result.get("links", [])
-    vless_link = None
-    for link in links:
-        if isinstance(link, str) and link.startswith("vless://"):
-            vless_link = _clean_vless_name(link, new_mar_username)
-            break
-
-    config.server_id = target_server.id
-    config.mar_username = new_mar_username
-    config.sub_token = new_sub_token
-    config.vless_link = vless_link
-    config.subscription_url = create_result.get("subscription_url", "")
-
-    # Счётчики
-    target_server.current_users_count += 1
-    if old_server.current_users_count > 0:
-        old_server.current_users_count -= 1
-
-    # Событие подписки
-    await log_sub_event(db, config_id=config_id, client_id=client_id,
-        event_type=SubscriptionEventType.MIGRATED,
-        description=f"Перенос: {old_server.name} → {target_server.name}",
-        details={
-            "old_server_id": old_server.id, "old_server_name": old_server.name,
-            "new_server_id": target_server.id, "new_server_name": target_server.name,
-            "old_username": config.mar_username, "new_username": new_mar_username,
-        },
-        initiated_by=admin_client.id,
-    )
-
-    # Уведомление клиенту
-    await notify_client(db, client_id=client_id,
-        notif_type=NotificationType.MIGRATED,
-        title="Подписка перенесена",
-        message=f"Ваша подписка перенесена на сервер {target_server.name}. Скопируйте новый ключ доступа в личном кабинете.",
-        config_id=config_id,
-    )
-
-    # Аудит-лог
-    await log_admin_action(db, admin_id=admin_client.id,
-        action=AdminActionType.CLIENT_SUB_MIGRATE,
-        description=f"Перенос подписки клиента #{client_id} с {old_server.name} на {target_server.name}",
-        target_type="config", target_id=config_id,
-        ip=request.client.host if request.client else None,
-    )
-
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "message": f"Подписка перенесена на {target_server.name}",
-        "new_server": target_server.name,
-        "new_vless_link": vless_link,
-    }
-
-
-# ═══════════════════════════════════════════════
-#  ИСТОРИЯ СОБЫТИЙ ПОДПИСКИ
-# ═══════════════════════════════════════════════
-
-@router.get("/clients/{client_id}/configs/{config_id}/events")
-async def get_subscription_events(
-    client_id: int,
-    config_id: int,
-    db: AsyncSession = Depends(get_db),
-    _=Depends(_any_admin),
-):
-    """Таймлайн событий подписки."""
-    result = await db.execute(
-        select(SubscriptionEvent)
-        .where(
-            SubscriptionEvent.config_id == config_id,
-            SubscriptionEvent.client_id == client_id,
-        )
-        .order_by(SubscriptionEvent.created_at.desc())
-    )
-    events = result.scalars().all()
-
-    return [
-        {
-            "id": e.id,
-            "event_type": e.event_type.value,
-            "description": e.description,
-            "details": json.loads(e.details_json) if e.details_json else None,
-            "initiated_by": e.initiated_by,
-            "created_at": e.created_at.isoformat() + "Z",
-        }
-        for e in events
-    ]
-
-
-# ═══════════════════════════════════════════════
-#  СПИСОК СЕРВЕРОВ ДЛЯ ПЕРЕНОСА
-# ═══════════════════════════════════════════════
-
-@router.get("/clients/{client_id}/configs/{config_id}/available-servers")
-async def get_available_servers_for_migration(
-    client_id: int,
-    config_id: int,
-    db: AsyncSession = Depends(get_db),
-    _=Depends(_owner_or_op),
-):
-    """Серверы доступные для переноса — тот же тир, есть слоты, не тот же сервер."""
-    config_result = await db.execute(
-        select(Config).options(selectinload(Config.server))
-        .where(Config.id == config_id, Config.client_id == client_id)
-    )
-    config = config_result.scalar_one_or_none()
-    if not config or not config.server:
-        raise HTTPException(status_code=404, detail="Подписка не найдена")
-
-    servers_result = await db.execute(
-        select(VPNServer)
-        .options(selectinload(VPNServer.tier))
-        .where(
-            VPNServer.tier_level == config.server.tier_level,
-            VPNServer.id != config.server_id,
-            VPNServer.is_active == True,
-        )
-        .order_by(VPNServer.current_users_count.asc())
-    )
-    servers = servers_result.scalars().all()
-
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "country_code": s.country_code,
-            "is_online": s.is_online,
-            "current_users": s.current_users_count,
-            "max_users": s.tier.default_max_users if s.tier else 0,
-            "free_slots": max(0, (s.tier.default_max_users if s.tier else 0) - s.current_users_count),
-        }
-        for s in servers
-    ]

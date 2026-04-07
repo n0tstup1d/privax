@@ -1,6 +1,5 @@
 import random
 import string
-import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -16,10 +15,8 @@ from dotenv import load_dotenv
 from auth.deps import get_current_user
 from auth.security import get_password_hash, verify_password, create_tokens
 from database.database import get_db
-from app.rate_limit import limiter
-from database.models import Client, RefreshToken, Config, LoginAttempt, PasswordResetCode, Referral, ReferralCode, ReferralSettings
+from database.models import Client, RefreshToken, Config, LoginAttempt, PasswordResetCode, Referral
 from schemas import Authorization
-from app.services.link_generator import build_sub_url
 
 load_dotenv()
 
@@ -107,7 +104,7 @@ def _serialize_config(c: Config) -> dict:
     now = datetime.utcnow()
     return {
         "id": c.id,
-        "sub_url": build_sub_url(c.sub_token),
+        "sub_url": f"/sub/{c.sub_token}" if c.sub_token else None,
         "expires_at": c.expire_at.isoformat() + "Z",
         "expired": c.expire_at < now,
         "auto_renew": c.auto_renew,
@@ -195,80 +192,37 @@ class ConfirmResetRequest(BaseModel):
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
-    ref_code: str  # обязательный — регистрация только по реферальной ссылке
+    ref_code: Optional[str] = None
 
 
 @router.post("/register")
-@limiter.limit("5/minute")
 async def register_client(
-    request: Request,
     body: RegisterRequest,
-    response: Response,
+    response: Response,             # ← добавлен response для установки cookies
     db: AsyncSession = Depends(get_db)
 ):
-    # ── 1. Проверяем реферальный код ──────────────────────────────────
-    ref_code = body.ref_code.strip().upper()
-
-    # Ищем код в таблице referral_codes (новая система)
-    rc = await db.scalar(
-        select(ReferralCode).where(
-            ReferralCode.code == ref_code,
-            ReferralCode.is_active == True,
-        )
-    )
-    # Фолбэк: старое поле client.referral_code (на случай кодов созданных до migrate)
-    referrer: Optional[Client] = None
-    if rc:
-        referrer_q = await db.execute(
-            select(Client).where(Client.id == rc.client_id)
-        )
-        referrer = referrer_q.scalar_one_or_none()
-    else:
-        referrer_q = await db.execute(
-            select(Client).where(Client.referral_code == ref_code)
-        )
-        referrer = referrer_q.scalar_one_or_none()
-
-    # Одинаковое сообщение для несуществующего и исчерпанного кода —
-    # не раскрываем, существует ли код вообще
-    if not referrer:
-        raise HTTPException(status_code=403, detail="Ссылка недействительна")
-
-    # ── 2. Проверяем лимит приглашений ────────────────────────────────
-    gs = await db.scalar(select(ReferralSettings).where(ReferralSettings.id == 1))
-    if gs and gs.invite_limit > 0:
-        used_count = await db.scalar(
-            select(func.count(Referral.id)).where(
-                Referral.referrer_id == referrer.id
-            )
-        )
-        if used_count >= gs.invite_limit:
-            raise HTTPException(status_code=403, detail="Ссылка недействительна")
-
-    # ── 3. Базовые проверки ───────────────────────────────────────────
-    existing = await db.execute(select(Client).filter(Client.email == body.email))
-    if existing.scalar_one_or_none():
+    result = await db.execute(select(Client).filter(Client.email == body.email))
+    if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Почта уже занята")
 
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Пароль должен быть не менее 8 символов")
-
-    # ── 4. Создаём клиента и реферальную связь ────────────────────────
-    new_client = Client(
-        email=body.email,
-        password=get_password_hash(body.password),
-        referred_by_id=referrer.id,
-    )
+    new_client = Client(email=body.email, password=get_password_hash(body.password))
     db.add(new_client)
     await db.flush()
 
-    db.add(Referral(referrer_id=referrer.id, referred_id=new_client.id))
+    if body.ref_code:
+        referrer_q = await db.execute(
+            select(Client).where(Client.referral_code == body.ref_code.upper())
+        )
+        referrer = referrer_q.scalar_one_or_none()
+        if referrer and referrer.id != new_client.id:
+            new_client.referred_by_id = referrer.id
+            db.add(Referral(referrer_id=referrer.id, referred_id=new_client.id))
 
-    # ── 5. Сессия ─────────────────────────────────────────────────────
     access_token, refresh_token = create_tokens({"sub": str(new_client.id)})
     db.add(RefreshToken(token=refresh_token, client=new_client))
     await db.commit()
 
+    # Кладём токены в httpOnly cookies — в тело НЕ возвращаем
     _set_auth_cookies(response, access_token, refresh_token)
 
     return {
@@ -282,7 +236,6 @@ async def register_client(
 # ═══════════════════════════════════════════════
 
 @router.post("/login")
-@limiter.limit("10/minute")
 async def login_user(
     request: Request,
     response: Response,             # ← добавлен response
@@ -450,8 +403,11 @@ async def reset_password_request(
         await db.commit()
 
         # TODO: заменить на email когда подключишь SMTP
-        logger = logging.getLogger("privax.auth")
-        logger.info(f"[RESET PASSWORD] Email: {client.email} | Code: {code} | Expires in {RESET_TTL} min")
+        print(f"\n{'='*40}")
+        print(f"[RESET PASSWORD] Email: {client.email}")
+        print(f"[RESET PASSWORD] Code:  {code}")
+        print(f"[RESET PASSWORD] Expires in {RESET_TTL} minutes")
+        print(f"{'='*40}\n")
 
     return {
         "status": "Если такой email существует — код сброса отправлен"

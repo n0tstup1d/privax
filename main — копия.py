@@ -1,41 +1,22 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from contextlib import asynccontextmanager
 import os
 from database.models import Base
 from database.database import engine
 from app.routers import auth, users, subscriptions, billing, faq, support
 from app.routers.admin import server, plans, domains, notifications
-from app.routers.admin import admin_auth, admin_stats, admin_managers, admin_feed
+from app.routers.admin import admin_auth, admin_stats, admin_managers
 from app.scheduler import start_scheduler
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import admin_clients
 from app.routers import subscription_serve
 from app.routers import promocodes
 from app.routers import referrals
-from app.routers import guides
 from dotenv import load_dotenv
 
 load_dotenv()
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    start_scheduler()
-    yield
-    # shutdown (если понадобится)
-
-
-app = FastAPI(title="Tugoka API", lifespan=lifespan)
-
-# Rate limiting
-from app.rate_limit import limiter, rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app = FastAPI(title="Privax API")
 
 os.makedirs("uploads/support", exist_ok=True)
 os.makedirs("uploads/faq", exist_ok=True)
@@ -54,6 +35,13 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    start_scheduler()
+
+
 app.include_router(auth.router,               prefix="/auth",          tags=["Authentication"])
 app.include_router(users.router,              prefix="/users",         tags=["Users"])
 app.include_router(subscriptions.router,      prefix="/subscriptions", tags=["Subscriptions"])
@@ -69,12 +57,10 @@ app.include_router(notifications.router,                               tags=["No
 app.include_router(admin_auth.router)
 app.include_router(admin_stats.router)
 app.include_router(admin_managers.router)
-app.include_router(admin_feed.router)
 app.include_router(faq.router,                                         tags=["FAQ"])
 app.include_router(support.router,                                     tags=["Support"])
-app.include_router(guides.router,                                      tags=["Guides"])
 
 
 @app.get("/")
 async def root():
-    return {"message": "Tugoka API is running"}
+    return {"message": "Privax API is running"}

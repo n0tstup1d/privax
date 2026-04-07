@@ -1,7 +1,5 @@
 import math
-import logging
 from datetime import datetime
-from urllib.parse import quote
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
@@ -10,56 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.deps import get_current_user
 from database.database import get_db
-from database.models import Client, Config, Invoice, ServicePlan, Notification, VPNServer
-from app.services.link_generator import build_sub_url
-from app.services.crypto_service import decrypt
+from database.models import Client, Config, Invoice, ServicePlan, Notification
 
 router = APIRouter()
-logger = logging.getLogger("privax.users")
-
-
-def _clean_vless_name(link: str, username: str) -> str:
-    """Заменяет Marzban-название на чистое username."""
-    if "#" in link:
-        base = link.split("#")[0]
-        return f"{base}#{quote(username)}"
-    return link
-
-
-async def _refresh_vless_link(config: Config, server: VPNServer, db: AsyncSession) -> str | None:
-    """
-    Запрашивает актуальную VLESS-ссылку с Marzban и обновляет в БД.
-    Возвращает ссылку или None если не удалось.
-    """
-    from app.services.marzban_service import get_marzban_user
-
-    try:
-        admin_user = decrypt(server.mar_admin_user)
-        admin_pass = decrypt(server.mar_admin_pass)
-
-        user_data = await get_marzban_user(
-            marzban_url=server.marzban_url,
-            admin_username=admin_user,
-            admin_password=admin_pass,
-            username=config.mar_username,
-        )
-
-        if not user_data.get("success"):
-            return config.vless_link  # фолбэк на старую
-
-        links = user_data.get("links", [])
-        for link in links:
-            if isinstance(link, str) and link.startswith("vless://"):
-                clean = _clean_vless_name(link, config.mar_username)
-                if clean != config.vless_link:
-                    config.vless_link = clean
-                    # НЕ коммитим тут — коммит будет в конце /users/me
-                return clean
-
-        return config.vless_link
-    except Exception as e:
-        logger.warning(f"Не удалось обновить vless_link для {config.mar_username}: {e}")
-        return config.vless_link
 
 
 @router.get("/me")
@@ -82,20 +33,10 @@ async def get_my_profile(
     configs = configs_result.scalars().all()
 
     # Группируем по group_id. getattr везде — защита от незапущенных миграций
-    # Фоном обновляем vless_link из Marzban для активных подписок
-    needs_commit = False
     groups: dict = {}
     for c in configs:
         plan = c.plan
         gid  = getattr(c, 'group_id', None) or str(c.id)
-
-        # Фоновое обновление vless_link — только для активных
-        vless_link = c.vless_link
-        if c.is_active and c.expire_at > now and c.server:
-            fresh = await _refresh_vless_link(c, c.server, db)
-            if fresh and fresh != vless_link:
-                vless_link = fresh
-                needs_commit = True
 
         if gid not in groups:
             expired = c.expire_at < now
@@ -128,8 +69,8 @@ async def get_my_profile(
             "id":           c.id,
             "device_index": dev_idx,
             "device_name":  dev_name,
-            "vless_link":   vless_link,
-            "sub_url":      build_sub_url(c.sub_token),
+            "vless_link":   c.vless_link,
+            "sub_url":      f"/sub/{c.sub_token}" if c.sub_token else None,
             "is_active":    c.is_active,
             "country_code": c.server.country_code if c.server else "?",
         })
@@ -179,10 +120,6 @@ async def get_my_profile(
         {"id": n.id, "title": n.title, "message": n.message, "created_at": n.created_at.isoformat()}
         for n in notifications
     ]
-
-    # Коммитим обновлённые vless_link если были изменения
-    if needs_commit:
-        await db.commit()
 
     return {
         "id":            current_user.id,
@@ -248,35 +185,3 @@ async def mark_notification_read(
     notif.is_read = True
     await db.commit()
     return {"status": "ok"}
-
-
-@router.get("/subscriptions/{config_id}/events")
-async def get_my_subscription_events(
-    config_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: Client = Depends(get_current_user)
-):
-    """История событий подписки — для клиента."""
-    from database.models import SubscriptionEvent
-    import json as _json
-
-    result = await db.execute(
-        select(SubscriptionEvent)
-        .where(
-            SubscriptionEvent.config_id == config_id,
-            SubscriptionEvent.client_id == current_user.id,
-        )
-        .order_by(SubscriptionEvent.created_at.desc())
-        .limit(50)
-    )
-    events = result.scalars().all()
-
-    return [
-        {
-            "id": e.id,
-            "event_type": e.event_type.value,
-            "description": e.description,
-            "created_at": e.created_at.isoformat() + "Z",
-        }
-        for e in events
-    ]
